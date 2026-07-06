@@ -256,18 +256,15 @@ fn extract_algorithm_content(
                     if let Some(sib_elem) = scraper::ElementRef::wrap(sib_node) {
                         match sib_elem.value().name() {
                             "ol" => {
-                                let steps =
-                                    algorithms::render_algorithm_ol(&sib_elem, converter);
+                                let steps = algorithms::render_algorithm_ol(&sib_elem, converter);
                                 return Some(format!("{}\n\n{}", intro.trim(), steps));
                             }
                             "ul" => {
-                                let steps =
-                                    algorithms::render_ul(&sib_elem, 0, converter);
+                                let steps = algorithms::render_ul(&sib_elem, 0, converter);
                                 return Some(format!("{}\n\n{}", intro.trim(), steps));
                             }
                             "dl" => {
-                                let steps =
-                                    algorithms::render_algorithm_dl(&sib_elem, converter);
+                                let steps = algorithms::render_algorithm_dl(&sib_elem, converter);
                                 return Some(format!("{}\n\n{}", intro.trim(), steps));
                             }
                             "p" | "div" | "h2" | "h3" | "h4" | "h5" | "h6" => break,
@@ -294,8 +291,7 @@ fn extract_from_algorithm_div(
 
     // Find the first list element (<ol>, <ul>, or <dl>)
     let list_tag = div.children().find_map(|child| {
-        scraper::ElementRef::wrap(child)
-            .filter(|e| matches!(e.value().name(), "ol" | "ul" | "dl"))
+        scraper::ElementRef::wrap(child).filter(|e| matches!(e.value().name(), "ol" | "ul" | "dl"))
     });
 
     // Build intro HTML from children before the first list
@@ -1553,8 +1549,7 @@ mod tests {
         // algorithm-like definitions use <ul> instead of <ol> for their conditions.
         // Regression: render-blocked was classified as Definition and only returned
         // the intro <p>, losing the <ul> conditions.
-        let html =
-            include_str!("../../tests/fixtures/algorithms/wattsi_ul_algorithm.html");
+        let html = include_str!("../../tests/fixtures/algorithms/wattsi_ul_algorithm.html");
         let converter = crate::parse::markdown::build_converter("https://html.spec.whatwg.org");
 
         let document = Html::parse_document(html);
