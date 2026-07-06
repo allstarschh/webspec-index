@@ -254,15 +254,24 @@ fn extract_algorithm_content(
                 let mut sibling = node.next_sibling();
                 while let Some(sib_node) = sibling {
                     if let Some(sib_elem) = scraper::ElementRef::wrap(sib_node) {
-                        if sib_elem.value().name() == "ol" {
-                            let steps = algorithms::render_algorithm_ol(&sib_elem, converter);
-                            return Some(format!("{}\n\n{}", intro.trim(), steps));
-                        }
-                        if matches!(
-                            sib_elem.value().name(),
-                            "p" | "div" | "h2" | "h3" | "h4" | "h5" | "h6"
-                        ) {
-                            break;
+                        match sib_elem.value().name() {
+                            "ol" => {
+                                let steps =
+                                    algorithms::render_algorithm_ol(&sib_elem, converter);
+                                return Some(format!("{}\n\n{}", intro.trim(), steps));
+                            }
+                            "ul" => {
+                                let steps =
+                                    algorithms::render_ul(&sib_elem, 0, converter);
+                                return Some(format!("{}\n\n{}", intro.trim(), steps));
+                            }
+                            "dl" => {
+                                let steps =
+                                    algorithms::render_algorithm_dl(&sib_elem, converter);
+                                return Some(format!("{}\n\n{}", intro.trim(), steps));
+                            }
+                            "p" | "div" | "h2" | "h3" | "h4" | "h5" | "h6" => break,
+                            _ => {}
                         }
                     }
                     sibling = sib_node.next_sibling();
@@ -276,21 +285,24 @@ fn extract_algorithm_content(
 }
 
 /// Extract algorithm content from a div.algorithm or div[data-algorithm] container.
-/// Properly separates the intro paragraph(s) from the steps <ol>.
+/// Properly separates the intro paragraph(s) from the list body (<ol>, <ul>, or <dl>).
 fn extract_from_algorithm_div(
     div: &scraper::ElementRef,
     converter: &HtmlToMarkdown,
 ) -> Option<String> {
-    use super::algorithms;
+    use super::{algorithms, markdown};
 
-    let ol_selector = scraper::Selector::parse("ol").ok()?;
-    let ol_elem = div.select(&ol_selector).next()?;
+    // Find the first list element (<ol>, <ul>, or <dl>)
+    let list_tag = div.children().find_map(|child| {
+        scraper::ElementRef::wrap(child)
+            .filter(|e| matches!(e.value().name(), "ol" | "ul" | "dl"))
+    });
 
-    // Build intro HTML from children before the first <ol>
+    // Build intro HTML from children before the first list
     let mut intro_html = String::new();
     for child in div.children() {
         if let Some(child_elem) = scraper::ElementRef::wrap(child) {
-            if child_elem.value().name() == "ol" {
+            if matches!(child_elem.value().name(), "ol" | "ul" | "dl") {
                 break;
             }
             intro_html.push_str(&child_elem.html());
@@ -304,8 +316,28 @@ fn extract_from_algorithm_div(
         .unwrap_or_default()
         .trim()
         .to_string();
-    let steps = algorithms::render_algorithm_ol(&ol_elem, converter);
-    Some(format!("{}\n\n{}", intro, steps))
+
+    match list_tag {
+        Some(list_elem) => {
+            let steps = match list_elem.value().name() {
+                "ol" => algorithms::render_algorithm_ol(&list_elem, converter),
+                "ul" => algorithms::render_ul(&list_elem, 0, converter),
+                "dl" => algorithms::render_algorithm_dl(&list_elem, converter),
+                _ => unreachable!(),
+            };
+            Some(format!("{}\n\n{}", intro, steps))
+        }
+        None => {
+            // No list body (e.g. single-sentence definitions inside div[data-algorithm])
+            let md = markdown::element_to_markdown(div, converter);
+            let trimmed = md.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+    }
 }
 
 /// Extract content for an IDL type (dfn with data-dfn-type)
@@ -543,11 +575,11 @@ fn is_inside_algorithm_content(element: &scraper::ElementRef) -> bool {
     let mut current = element.parent();
     while let Some(node) = current {
         if let Some(parent_elem) = scraper::ElementRef::wrap(node) {
-            if parent_elem.value().name() == "ol" {
-                // Found an <ol> ancestor. Now check if this <ol> is part of an algorithm.
+            if matches!(parent_elem.value().name(), "ol" | "ul") {
+                // Found a list ancestor. Now check if this list is part of an algorithm.
                 // Two patterns:
                 // 1. Bikeshed: <div class="algorithm">...<ol>...</ol></div>
-                // 2. Wattsi: <p>To <dfn>foo</dfn>:</p><ol>...</ol> (sibling pattern)
+                // 2. Wattsi: <p>To <dfn>foo</dfn>:</p><ol|ul>...</ol|ul> (sibling pattern)
 
                 // Check if <ol> is inside div.algorithm or div[data-algorithm]
                 let mut ol_ancestor = parent_elem.parent();
@@ -600,13 +632,15 @@ fn is_inside_algorithm_content(element: &scraper::ElementRef) -> bool {
 /// Check if an element is inside a <div class="algorithm"> or followed by sibling <ol>
 /// Detects both Bikeshed style (div.algorithm wrapping) and Wattsi style (sibling ol)
 fn is_inside_algorithm_div(element: &scraper::ElementRef) -> bool {
-    // First check Bikeshed pattern: parent div.algorithm
+    // First check Bikeshed/Wattsi div pattern: div.algorithm or div[data-algorithm]
     let mut current = element.parent();
     while let Some(node) = current {
         if let Some(parent_elem) = scraper::ElementRef::wrap(node) {
             if parent_elem.value().name() == "div" {
                 let classes: Vec<_> = parent_elem.value().classes().collect();
-                if classes.contains(&"algorithm") {
+                if classes.contains(&"algorithm")
+                    || parent_elem.value().attr("data-algorithm").is_some()
+                {
                     return true;
                 }
             }
@@ -618,7 +652,7 @@ fn is_inside_algorithm_div(element: &scraper::ElementRef) -> bool {
                 let mut sibling = node.next_sibling();
                 while let Some(sib_node) = sibling {
                     if let Some(sib_elem) = scraper::ElementRef::wrap(sib_node) {
-                        if sib_elem.value().name() == "ol" {
+                        if matches!(sib_elem.value().name(), "ol" | "ul" | "dl") {
                             return true;
                         }
                         // Stop if we hit another block element (not whitespace)
@@ -1221,6 +1255,59 @@ mod tests {
     }
 
     #[test]
+    fn test_wattsi_dl_switch_algorithm_pattern() {
+        // Test Wattsi-style algorithm with <dl class="switch"> body instead of <ol>:
+        // <p>To <dfn>foo</dfn>, run the first matching steps:</p><dl class="switch">...</dl>
+        // Regression test: this pattern was previously misclassified as a plain definition,
+        // returning only the intro sentence.
+        let html = include_str!("../../tests/fixtures/algorithms/wattsi_dl_switch.html");
+        let converter = crate::parse::markdown::build_converter("https://html.spec.whatwg.org");
+
+        let document = Html::parse_document(html);
+        let selector = Selector::parse("dfn[id]").unwrap();
+
+        let mut algorithms = Vec::new();
+        for element in document.select(&selector) {
+            if let Some(section) = parse_dfn_element(&element, &converter).unwrap() {
+                algorithms.push(section);
+            }
+        }
+
+        assert_eq!(algorithms.len(), 1, "Should detect one algorithm");
+        let algo = &algorithms[0];
+
+        assert_eq!(algo.anchor, "get-the-focusable-area");
+        assert_eq!(
+            algo.section_type,
+            SectionType::Algorithm,
+            "dl.switch pattern should be classified as Algorithm, not Definition"
+        );
+
+        let content = algo.content_text.as_ref().unwrap();
+        assert!(
+            content.contains("get the focusable area"),
+            "Should include intro text"
+        );
+        assert!(
+            content.contains("area"),
+            "Should include area element case from dl"
+        );
+        assert!(
+            content.contains("shadow host"),
+            "Should include shadow host case from dl"
+        );
+        assert!(
+            content.contains("Return null"),
+            "Should include the Otherwise/Return null case"
+        );
+        // The shadow host dd has an <ol> with numbered steps
+        assert!(
+            content.contains("1."),
+            "Should include numbered steps from ol inside dd"
+        );
+    }
+
+    #[test]
     fn test_dfn_inside_algorithm_content_skipped() {
         // Dfns that appear inside algorithm <ol> content should NOT be collected as separate sections
         // They're part of the algorithm's markdown content
@@ -1458,6 +1545,77 @@ mod tests {
             !anchors.contains(&"dom-audiodecoder-configure-config"),
             "Argument should be skipped"
         );
+    }
+
+    #[test]
+    fn test_wattsi_data_algorithm_with_ul() {
+        // Wattsi uses <div data-algorithm=""> (not class="algorithm") and some
+        // algorithm-like definitions use <ul> instead of <ol> for their conditions.
+        // Regression: render-blocked was classified as Definition and only returned
+        // the intro <p>, losing the <ul> conditions.
+        let html =
+            include_str!("../../tests/fixtures/algorithms/wattsi_ul_algorithm.html");
+        let converter = crate::parse::markdown::build_converter("https://html.spec.whatwg.org");
+
+        let document = Html::parse_document(html);
+        let selector = Selector::parse("dfn[id]").unwrap();
+
+        let mut sections = Vec::new();
+        for element in document.select(&selector) {
+            if let Some(section) = parse_dfn_element(&element, &converter).unwrap() {
+                sections.push(section);
+            }
+        }
+
+        assert_eq!(sections.len(), 3, "Should detect all three dfns");
+
+        // render-blocked: div[data-algorithm] with <ul> body
+        let render_blocked = sections
+            .iter()
+            .find(|s| s.anchor == "render-blocked")
+            .expect("render-blocked should be present");
+        assert_eq!(
+            render_blocked.section_type,
+            SectionType::Algorithm,
+            "div[data-algorithm] should be classified as Algorithm"
+        );
+        let content = render_blocked.content_text.as_ref().unwrap();
+        assert!(
+            content.contains("render-blocked"),
+            "Should include intro text"
+        );
+        assert!(
+            content.contains("render-blocking element set"),
+            "Should include first condition from <ul>"
+        );
+        assert!(
+            content.contains("implementation-defined"),
+            "Should include second condition from <ul>"
+        );
+
+        // allows-adding-render-blocking-elements: div[data-algorithm] with no list body
+        let allows = sections
+            .iter()
+            .find(|s| s.anchor == "allows-adding-render-blocking-elements")
+            .expect("allows-adding should be present");
+        assert_eq!(
+            allows.section_type,
+            SectionType::Algorithm,
+            "div[data-algorithm] should be classified as Algorithm"
+        );
+
+        // block-rendering: div[data-algorithm] with <ol> body (normal case)
+        let block_rendering = sections
+            .iter()
+            .find(|s| s.anchor == "block-rendering")
+            .expect("block-rendering should be present");
+        assert_eq!(
+            block_rendering.section_type,
+            SectionType::Algorithm,
+            "div[data-algorithm] with <ol> should be Algorithm"
+        );
+        let content = block_rendering.content_text.as_ref().unwrap();
+        assert!(content.contains("1. "), "Should include numbered steps");
     }
 
     // -- TC39/ecmarkup emu-clause tests --

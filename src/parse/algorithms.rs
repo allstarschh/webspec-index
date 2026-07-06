@@ -2,6 +2,59 @@
 use htmd::HtmlToMarkdown;
 use scraper::{ElementRef, Node};
 
+/// Render an algorithm's `<dl>` element (e.g. `<dl class="switch">`) as markdown.
+/// Each `<dt>` is a condition and each `<dd>` is the corresponding action.
+/// `<ol>` elements inside `<dd>` are rendered with `render_algorithm_ol` for consistency.
+pub fn render_algorithm_dl(dl_element: &ElementRef, converter: &HtmlToMarkdown) -> String {
+    let mut result = String::new();
+
+    for child in dl_element.children() {
+        let Some(child_element) = ElementRef::wrap(child) else {
+            continue;
+        };
+
+        match child_element.value().name() {
+            "dt" => {
+                let md = converter
+                    .convert(&child_element.inner_html())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if !md.is_empty() {
+                    if !result.is_empty() {
+                        result.push_str("\n\n");
+                    }
+                    result.push_str(&md);
+                }
+            }
+            "dd" => {
+                for dd_child in child_element.children() {
+                    if let Some(dd_elem) = ElementRef::wrap(dd_child) {
+                        let content = if dd_elem.value().name() == "ol" {
+                            render_algorithm_ol(&dd_elem, converter)
+                        } else {
+                            converter
+                                .convert(&dd_elem.html())
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string()
+                        };
+                        if !content.is_empty() {
+                            if !result.is_empty() {
+                                result.push_str("\n\n");
+                            }
+                            result.push_str(&content);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    result.trim().to_string()
+}
+
 /// Render an algorithm's `<ol>` element with markdown-style numbering.
 /// Nested lists use simple numbering (1., 2., etc.) with indentation - markdown handles visual hierarchy.
 /// Inline content is converted to markdown using the provided converter.
@@ -186,7 +239,7 @@ fn indent_lines(text: &str, indent: usize) -> String {
 }
 
 /// Render a `<ul>` element with proper indentation
-fn render_ul(ul: &ElementRef, indent: usize, converter: &HtmlToMarkdown) -> String {
+pub fn render_ul(ul: &ElementRef, indent: usize, converter: &HtmlToMarkdown) -> String {
     let mut result = String::new();
 
     for child in ul.children() {
@@ -465,5 +518,53 @@ mod tests {
 
         // Step 2 should be present
         assert!(result.contains("2. Next step"));
+    }
+
+    #[test]
+    fn test_dl_switch_from_html_spec() {
+        let html = include_str!("../../tests/fixtures/algorithms/wattsi_dl_switch.html");
+        let fragment = Html::parse_fragment(html);
+        let selector = Selector::parse("dl").unwrap();
+        let dl = fragment.select(&selector).next().unwrap();
+
+        let result = render_algorithm_dl(&dl, &test_converter());
+
+        // All dt conditions should be present
+        assert!(
+            result.contains("area"),
+            "should contain area element case: {result}"
+        );
+        assert!(
+            result.contains("scrollable region"),
+            "should contain scrollable regions case: {result}"
+        );
+        assert!(
+            result.contains("shadow host"),
+            "should contain shadow host case: {result}"
+        );
+        assert!(
+            result.contains("Otherwise"),
+            "should contain Otherwise case: {result}"
+        );
+        assert!(
+            result.contains("Return null"),
+            "should contain Return null: {result}"
+        );
+
+        // The shadow host dd contains an <ol> — should be rendered with numbered steps
+        assert!(
+            result.contains("1."),
+            "shadow host case should have numbered steps: {result}"
+        );
+        assert!(
+            result.contains("focus delegate"),
+            "should contain focus delegate step: {result}"
+        );
+
+        // The note should be rendered
+        assert!(
+            result.contains("sequential focusability"),
+            "should contain the note about sequential focusability: {result}"
+        );
     }
 }

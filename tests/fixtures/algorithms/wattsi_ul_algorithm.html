@@ -1,0 +1,28 @@
+<div data-algorithm="">
+<p>A <code><a href="#document">Document</a></code> <var>document</var> <dfn id="allows-adding-render-blocking-elements">allows adding render-blocking elements</dfn>
+if <var>document</var>'s <a href="https://dom.spec.whatwg.org/#concept-document-content-type">content type</a> is
+"<code><a href="#text/html">text/html</a></code>" and <a href="#the-body-element-2">the body element</a> of <var>document</var> is null.</p>
+</div>
+
+<div data-algorithm="">
+<p>A <code><a href="#document">Document</a></code> <var>document</var> is <dfn id="render-blocked">render-blocked</dfn> if both of the
+following are true:</p>
+
+<ul><li><p><var>document</var>'s <a href="#render-blocking-element-set">render-blocking element set</a> is non-empty, or
+ <var>document</var> <a href="#allows-adding-render-blocking-elements">allows adding render-blocking elements</a>.</p>
+
+ </li><li><p>The <a href="https://w3c.github.io/hr-time/#dfn-current-high-resolution-time">current high resolution time</a> given <var>document</var>'s <a href="#concept-relevant-global">relevant
+ global object</a> has not exceeded an <a href="https://infra.spec.whatwg.org/#implementation-defined">implementation-defined</a> timeout value.</p>
+</li></ul>
+</div>
+
+<div data-algorithm="">
+<p>To <dfn id="block-rendering">block rendering</dfn> on an element <var>el</var>:</p>
+
+<ol><li><p>Let <var>document</var> be <var>el</var>'s <a href="https://dom.spec.whatwg.org/#concept-node-document">node document</a>.</p>
+
+ </li><li><p>If <var>document</var> <a href="#allows-adding-render-blocking-elements">allows adding render-blocking elements</a>, then
+ <a href="https://infra.spec.whatwg.org/#set-append">append</a> <var>el</var> to <var>document</var>'s
+ <a href="#render-blocking-element-set">render-blocking element set</a>.</p>
+</li></ol>
+</div>
