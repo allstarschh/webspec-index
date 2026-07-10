@@ -129,6 +129,33 @@ async fn fetch_live_html(base_url: &str) -> Result<String> {
     Ok(html)
 }
 
+/// Outcome of a live-fetch attempt during a sync.
+enum FetchOutcome {
+    /// Fresh HTML that should be (re)parsed.
+    Fresh(String),
+    /// The fetch failed but a cached snapshot exists; serve it instead of failing.
+    ServeCached(i64),
+}
+
+/// Decide how to proceed after attempting a live fetch. On failure, fall back to
+/// the cached snapshot only when `allow_fallback` is set (best-effort refresh)
+/// and a cached snapshot exists; otherwise propagate the fetch error. A forced
+/// refresh disallows the fallback so failures surface instead of silently
+/// serving stale data.
+fn resolve_fetch(
+    fetched: Result<String>,
+    previous_snapshot_id: Option<i64>,
+    allow_fallback: bool,
+) -> Result<FetchOutcome> {
+    match fetched {
+        Ok(html) => Ok(FetchOutcome::Fresh(html)),
+        Err(e) => match previous_snapshot_id {
+            Some(snapshot_id) if allow_fallback => Ok(FetchOutcome::ServeCached(snapshot_id)),
+            _ => Err(e),
+        },
+    }
+}
+
 async fn sync_known_spec(
     conn: &Connection,
     spec_name: &str,
@@ -149,18 +176,26 @@ async fn sync_known_spec(
         }
     }
 
-    let html = fetch_live_html(base_url).await?;
-    sync_from_html(
-        conn,
-        spec_id,
-        spec_name,
-        base_url,
-        provider_name,
-        html,
+    // A forced refresh must surface fetch failures; otherwise fall back to the
+    // cached snapshot when offline.
+    match resolve_fetch(
+        fetch_live_html(base_url).await,
         previous_snapshot_id,
-        state,
-        &now,
-    )
+        !force,
+    )? {
+        FetchOutcome::ServeCached(snapshot_id) => Ok((snapshot_id, false)),
+        FetchOutcome::Fresh(html) => sync_from_html(
+            conn,
+            spec_id,
+            spec_name,
+            base_url,
+            provider_name,
+            html,
+            previous_snapshot_id,
+            state,
+            &now,
+        ),
+    }
 }
 
 /// Same as [`sync_known_spec`], for ad-hoc URL-based specs whose provider is
@@ -230,4 +265,32 @@ pub async fn update_all_specs(
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // On fetch failure, resolve_fetch falls back to a cached snapshot only when
+    // fallback is allowed and a snapshot exists; otherwise it propagates the error.
+    #[test]
+    fn test_resolve_fetch() {
+        // Success -> parse the fresh HTML regardless of cache/fallback state.
+        match resolve_fetch(Ok("<html></html>".to_string()), None, true).unwrap() {
+            FetchOutcome::Fresh(html) => assert_eq!(html, "<html></html>"),
+            FetchOutcome::ServeCached(_) => panic!("expected Fresh on success"),
+        }
+
+        // Failure, fallback allowed, cached snapshot present -> serve the cache.
+        match resolve_fetch(Err(anyhow::anyhow!("offline")), Some(42), true).unwrap() {
+            FetchOutcome::ServeCached(id) => assert_eq!(id, 42),
+            FetchOutcome::Fresh(_) => panic!("expected ServeCached on failure with cache"),
+        }
+
+        // Failure with no cached snapshot -> propagate the error.
+        assert!(resolve_fetch(Err(anyhow::anyhow!("offline")), None, true).is_err());
+
+        // Failure with a cache but fallback disallowed (e.g. --force) -> propagate.
+        assert!(resolve_fetch(Err(anyhow::anyhow!("offline")), Some(42), false).is_err());
+    }
 }
