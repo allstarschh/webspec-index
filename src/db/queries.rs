@@ -10,6 +10,7 @@ pub struct UpdateCheckState {
     pub last_checked: DateTime<Utc>,
     pub last_indexed: Option<DateTime<Utc>>,
     pub content_hash: Option<String>,
+    pub index_version: Option<String>,
 }
 
 pub type PrSnapshotRow = (String, i64, String, String, i64);
@@ -148,21 +149,31 @@ pub fn list_specs(conn: &Connection) -> Result<Vec<(String, String, String)>> {
 /// Get sync metadata for a spec from update_checks.
 pub fn get_update_check(conn: &Connection, spec_id: i64) -> Result<Option<UpdateCheckState>> {
     let row = conn.query_row(
-        "SELECT last_checked, last_indexed, content_hash
+        "SELECT last_checked, last_indexed, content_hash, index_version
          FROM update_checks
          WHERE spec_id = ?1",
         [spec_id],
         |row| {
+            // Coerce index_version to text. A legacy integer value written by
+            // an earlier build (when this held a numeric parser version) reads
+            // back as None, which correctly forces a re-index.
+            let index_version = match row.get_ref(3)? {
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                _ => None,
+            };
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                index_version,
             ))
         },
     );
 
     match row {
-        Ok((checked, indexed, content_hash)) => {
+        Ok((checked, indexed, content_hash, index_version)) => {
             let last_checked = DateTime::parse_from_rfc3339(&checked)
                 .map(|d| d.with_timezone(&Utc))
                 .map_err(|e| {
@@ -192,6 +203,7 @@ pub fn get_update_check(conn: &Connection, spec_id: i64) -> Result<Option<Update
                 last_checked,
                 last_indexed,
                 content_hash,
+                index_version,
             }))
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -683,6 +695,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             Some("2026-01-01T00:00:00Z"),
             Some("abc123"),
+            Some("0.9.9"),
         )
         .unwrap();
 
@@ -693,6 +706,7 @@ mod tests {
             "2026-01-01T00:00:00+00:00"
         );
         assert_eq!(state.content_hash.as_deref(), Some("abc123"));
+        assert_eq!(state.index_version.as_deref(), Some("0.9.9"));
     }
 
     #[test]

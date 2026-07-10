@@ -16,6 +16,21 @@ fn is_fresh(last_checked: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
     now.signed_duration_since(*last_checked).num_hours() < CHECK_INTERVAL_HOURS
 }
 
+/// Whether the cached index was produced by the current build. A new release
+/// (bumped `INDEX_VERSION`) makes this false, forcing a re-parse even when the
+/// upstream HTML is unchanged.
+fn index_is_current(state: &queries::UpdateCheckState) -> bool {
+    state.index_version.as_deref() == Some(parse::INDEX_VERSION)
+}
+
+/// Whether a cached spec can be served without re-syncing: it must be within the
+/// freshness window AND have been produced by the current build. A version
+/// upgrade invalidates the freshness window so the next query re-indexes even if
+/// the 24h check has not elapsed.
+fn cache_is_current(state: &queries::UpdateCheckState, now: &DateTime<Utc>) -> bool {
+    is_fresh(&state.last_checked, now) && index_is_current(state)
+}
+
 fn hash_html(html: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(html.as_bytes());
@@ -32,7 +47,14 @@ fn store_update_check(
 ) -> Result<()> {
     let checked = now.to_rfc3339();
     let indexed = last_indexed.map(|t| t.to_rfc3339());
-    write::record_update_check(conn, spec_id, &checked, indexed.as_deref(), content_hash)
+    write::record_update_check(
+        conn,
+        spec_id,
+        &checked,
+        indexed.as_deref(),
+        content_hash,
+        Some(parse::INDEX_VERSION),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49,10 +71,16 @@ fn sync_from_html(
 ) -> Result<(i64, bool)> {
     let content_hash = hash_html(&html);
 
-    if let Some(snapshot_id) = previous_snapshot_id {
-        if state.as_ref().and_then(|s| s.content_hash.as_deref()) == Some(content_hash.as_str()) {
-            let existing_indexed = state.as_ref().and_then(|s| s.last_indexed.as_ref());
-            store_update_check(conn, spec_id, now, existing_indexed, Some(&content_hash))?;
+    if let (Some(snapshot_id), Some(state)) = (previous_snapshot_id, state.as_ref()) {
+        let content_unchanged = state.content_hash.as_deref() == Some(content_hash.as_str());
+        if content_unchanged && index_is_current(state) {
+            store_update_check(
+                conn,
+                spec_id,
+                now,
+                state.last_indexed.as_ref(),
+                Some(&content_hash),
+            )?;
             return Ok((snapshot_id, false));
         }
     }
@@ -170,7 +198,7 @@ async fn sync_known_spec(
 
     if !force {
         if let (Some(snapshot_id), Some(sync_state)) = (previous_snapshot_id, state.as_ref()) {
-            if is_fresh(&sync_state.last_checked, &now) {
+            if cache_is_current(sync_state, &now) {
                 return Ok((snapshot_id, false));
             }
         }
@@ -270,6 +298,24 @@ pub async fn update_all_specs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn state_with(index_version: Option<&str>, last_checked: &str) -> queries::UpdateCheckState {
+        queries::UpdateCheckState {
+            last_checked: DateTime::parse_from_rfc3339(last_checked)
+                .unwrap()
+                .with_timezone(&Utc),
+            last_indexed: None,
+            content_hash: Some("hash".to_string()),
+            index_version: index_version.map(str::to_string),
+        }
+    }
 
     // On fetch failure, resolve_fetch falls back to a cached snapshot only when
     // fallback is allowed and a snapshot exists; otherwise it propagates the error.
@@ -292,5 +338,103 @@ mod tests {
 
         // Failure with a cache but fallback disallowed (e.g. --force) -> propagate.
         assert!(resolve_fetch(Err(anyhow::anyhow!("offline")), Some(42), false).is_err());
+    }
+
+    // The freshness gate must require BOTH a fresh timestamp and a matching
+    // index version before serving cached data without a re-sync.
+    #[test]
+    fn test_cache_is_current() {
+        let now = fixed_now();
+
+        // Fresh + current build -> serve cache.
+        assert!(cache_is_current(
+            &state_with(Some(parse::INDEX_VERSION), "2026-01-01T00:00:00Z"),
+            &now
+        ));
+
+        // Fresh but produced by an older build (or pre-upgrade NULL) -> re-sync.
+        assert!(!cache_is_current(
+            &state_with(Some("0.0.0"), "2026-01-01T00:00:00Z"),
+            &now
+        ));
+        assert!(!cache_is_current(
+            &state_with(None, "2026-01-01T00:00:00Z"),
+            &now
+        ));
+
+        // Current build but stale (older than the 24h window) -> re-sync.
+        assert!(!cache_is_current(
+            &state_with(Some(parse::INDEX_VERSION), "2020-01-01T00:00:00Z"),
+            &now
+        ));
+    }
+
+    // A version change (bumped INDEX_VERSION) must force a re-parse of an already
+    // cached spec even when the upstream HTML is byte-for-byte unchanged.
+    #[test]
+    fn test_sync_reparses_on_version_bump() {
+        let conn = db::open_test_db().unwrap();
+        let spec_id =
+            write::insert_or_get_spec(&conn, "TEST", "https://example.test", "test").unwrap();
+        let html = "<h2 id=\"intro\">Intro</h2>".to_string();
+        let now = fixed_now();
+
+        // First index: no previous snapshot -> parse.
+        let (snap1, updated1) = sync_from_html(
+            &conn,
+            spec_id,
+            "TEST",
+            "https://example.test",
+            "test",
+            html.clone(),
+            None,
+            None,
+            &now,
+        )
+        .unwrap();
+        assert!(updated1, "first index should parse");
+
+        // Second: identical content, state stamped with the current index
+        // version -> skip re-parsing.
+        let state = queries::get_update_check(&conn, spec_id).unwrap();
+        assert_eq!(
+            state.as_ref().and_then(|s| s.index_version.as_deref()),
+            Some(parse::INDEX_VERSION)
+        );
+        let (snap2, updated2) = sync_from_html(
+            &conn,
+            spec_id,
+            "TEST",
+            "https://example.test",
+            "test",
+            html.clone(),
+            Some(snap1),
+            state,
+            &now,
+        )
+        .unwrap();
+        assert!(!updated2, "unchanged content + current parser should skip");
+        assert_eq!(snap2, snap1);
+
+        // Third: identical content, but the stored index was produced by an older
+        // build version -> must re-parse.
+        let mut stale = queries::get_update_check(&conn, spec_id).unwrap().unwrap();
+        stale.index_version = Some("0.0.0".to_string());
+        let (_snap3, updated3) = sync_from_html(
+            &conn,
+            spec_id,
+            "TEST",
+            "https://example.test",
+            "test",
+            html.clone(),
+            Some(snap2),
+            Some(stale),
+            &now,
+        )
+        .unwrap();
+        assert!(
+            updated3,
+            "index version change should force re-parse despite unchanged content"
+        );
     }
 }

@@ -32,6 +32,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             pr_number   INTEGER,
             merge_base_sha TEXT,
             pr_pages    TEXT,
+            index_version TEXT,
             UNIQUE(spec_id, sha)
         );
 
@@ -78,10 +79,11 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX idx_idl_defs_canonical ON idl_defs(snapshot_id, canonical_name);
 
         CREATE TABLE update_checks (
-            spec_id     INTEGER PRIMARY KEY REFERENCES specs(id),
-            last_checked TEXT NOT NULL,
-            last_indexed TEXT,
-            content_hash TEXT
+            spec_id        INTEGER PRIMARY KEY REFERENCES specs(id),
+            last_checked   TEXT NOT NULL,
+            last_indexed   TEXT,
+            content_hash   TEXT,
+            index_version TEXT
         );
 
         CREATE VIRTUAL TABLE sections_fts USING fts5(
@@ -132,35 +134,60 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_idl_defs_anchor ON idl_defs(snapshot_id, anchor);
         CREATE INDEX IF NOT EXISTS idx_idl_defs_canonical ON idl_defs(snapshot_id, canonical_name);
         CREATE TABLE IF NOT EXISTS update_checks (
-            spec_id      INTEGER PRIMARY KEY REFERENCES specs(id),
-            last_checked TEXT NOT NULL,
-            last_indexed TEXT,
-            content_hash TEXT
+            spec_id        INTEGER PRIMARY KEY REFERENCES specs(id),
+            last_checked   TEXT NOT NULL,
+            last_indexed   TEXT,
+            content_hash   TEXT,
+            index_version TEXT
         );",
     )?;
 
+    // Rename the pre-existing `parser_version` column (from an earlier build)
+    // to `index_version`, preserving its data, before ensuring the column exists.
+    rename_column(conn, "update_checks", "parser_version", "index_version")?;
+    rename_column(conn, "snapshots", "parser_version", "index_version")?;
+
     ensure_column(conn, "update_checks", "last_indexed", "TEXT")?;
     ensure_column(conn, "update_checks", "content_hash", "TEXT")?;
+    ensure_column(conn, "update_checks", "index_version", "TEXT")?;
     ensure_column(conn, "snapshots", "pr_number", "INTEGER")?;
     ensure_column(conn, "snapshots", "merge_base_sha", "TEXT")?;
     ensure_column(conn, "snapshots", "pr_pages", "TEXT")?;
+    ensure_column(conn, "snapshots", "index_version", "TEXT")?;
     Ok(())
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let name: String = row.get(1)?;
         if name == column {
-            return Ok(());
+            return Ok(true);
         }
     }
+    Ok(false)
+}
 
-    conn.execute(
-        &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
-        [],
-    )?;
+fn ensure_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+    if !has_column(conn, table, column)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Rename a column, but only when the old name still exists and the new name
+/// does not — so the migration is a no-op on already-migrated and fresh databases.
+fn rename_column(conn: &Connection, table: &str, old: &str, new: &str) -> Result<()> {
+    if has_column(conn, table, old)? && !has_column(conn, table, new)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} RENAME COLUMN {old} TO {new}"),
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -267,6 +294,153 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pr, None);
+    }
+
+    #[test]
+    fn test_index_version_column_migration() {
+        // Simulate a pre-parser-version database: update_checks without the
+        // column, containing a row written by an older binary.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE specs (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                base_url TEXT NOT NULL,
+                provider TEXT NOT NULL
+            );
+            CREATE TABLE snapshots (
+                id          INTEGER PRIMARY KEY,
+                spec_id     INTEGER NOT NULL REFERENCES specs(id),
+                sha         TEXT NOT NULL,
+                commit_date TEXT NOT NULL,
+                indexed_at  TEXT NOT NULL,
+                is_latest   INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(spec_id, sha)
+            );
+            CREATE TABLE update_checks (
+                spec_id      INTEGER PRIMARY KEY REFERENCES specs(id),
+                last_checked TEXT NOT NULL,
+                last_indexed TEXT,
+                content_hash TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO specs (name, base_url, provider) VALUES ('TEST', 'https://test', 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO update_checks (spec_id, last_checked, content_hash)
+             VALUES (1, '2026-01-01T00:00:00Z', 'oldhash')",
+            [],
+        )
+        .unwrap();
+        // A snapshot written by an older binary (no index_version column yet).
+        conn.execute(
+            "INSERT INTO snapshots (spec_id, sha, commit_date, indexed_at)
+             VALUES (1, 'oldsha', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Migration must add the columns without dropping the existing rows.
+        run_migrations(&conn).unwrap();
+
+        // Rows written before the upgrade read back as NULL index_version,
+        // which is what forces a re-parse on the next sync.
+        let pv: Option<String> = conn
+            .query_row(
+                "SELECT index_version FROM update_checks WHERE spec_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pv, None);
+        let snap_pv: Option<String> = conn
+            .query_row(
+                "SELECT index_version FROM snapshots WHERE sha = 'oldsha'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(snap_pv, None, "snapshots.index_version should migrate too");
+
+        // The column is writable after migration.
+        conn.execute(
+            "UPDATE update_checks SET index_version = '0.5.0' WHERE spec_id = 1",
+            [],
+        )
+        .unwrap();
+        let pv: Option<String> = conn
+            .query_row(
+                "SELECT index_version FROM update_checks WHERE spec_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pv.as_deref(), Some("0.5.0"));
+    }
+
+    #[test]
+    fn test_parser_version_renamed_to_index_version() {
+        // Simulate a database from the intermediate build that still has the
+        // old `parser_version` column, with a value that must be preserved.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE specs (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                base_url TEXT NOT NULL,
+                provider TEXT NOT NULL
+            );
+            CREATE TABLE snapshots (
+                id          INTEGER PRIMARY KEY,
+                spec_id     INTEGER NOT NULL REFERENCES specs(id),
+                sha         TEXT NOT NULL,
+                commit_date TEXT NOT NULL,
+                indexed_at  TEXT NOT NULL,
+                parser_version TEXT,
+                UNIQUE(spec_id, sha)
+            );
+            CREATE TABLE update_checks (
+                spec_id        INTEGER PRIMARY KEY REFERENCES specs(id),
+                last_checked   TEXT NOT NULL,
+                last_indexed   TEXT,
+                content_hash   TEXT,
+                parser_version TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO specs (name, base_url, provider) VALUES ('TEST', 'https://test', 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO update_checks (spec_id, last_checked, content_hash, parser_version)
+             VALUES (1, '2026-01-01T00:00:00Z', 'oldhash', '0.11.0')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        // The old column is gone and its value survived under the new name.
+        assert!(!has_column(&conn, "update_checks", "parser_version").unwrap());
+        assert!(has_column(&conn, "update_checks", "index_version").unwrap());
+        assert!(has_column(&conn, "snapshots", "index_version").unwrap());
+        let pv: Option<String> = conn
+            .query_row(
+                "SELECT index_version FROM update_checks WHERE spec_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pv.as_deref(), Some("0.11.0"));
+
+        // Re-running is a no-op (rename guard sees the new column already exists).
+        run_migrations(&conn).unwrap();
     }
 
     #[test]

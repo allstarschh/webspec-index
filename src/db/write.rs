@@ -69,9 +69,15 @@ pub fn insert_snapshot(
 
     // Insert the snapshot
     conn.execute(
-        "INSERT INTO snapshots (spec_id, sha, commit_date, indexed_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        (spec_id, sha, commit_date, &indexed_at),
+        "INSERT INTO snapshots (spec_id, sha, commit_date, indexed_at, index_version)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            spec_id,
+            sha,
+            commit_date,
+            &indexed_at,
+            crate::parse::INDEX_VERSION,
+        ),
     )?;
 
     // Get the ID
@@ -187,9 +193,9 @@ pub fn insert_pr_snapshot(
     let indexed_at = chrono::Utc::now().to_rfc3339();
     let pages_str = pr_pages.join(",");
     conn.execute(
-        "INSERT OR REPLACE INTO snapshots (spec_id, sha, commit_date, indexed_at, pr_number, merge_base_sha, pr_pages)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        (spec_id, sha, commit_date, &indexed_at, pr_number, merge_base_sha, &pages_str),
+        "INSERT OR REPLACE INTO snapshots (spec_id, sha, commit_date, indexed_at, pr_number, merge_base_sha, pr_pages, index_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        (spec_id, sha, commit_date, &indexed_at, pr_number, merge_base_sha, &pages_str, crate::parse::INDEX_VERSION),
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -216,6 +222,17 @@ pub fn delete_pr_data(conn: &Connection, spec_id: i64, pr_number: i64) -> Result
         "DELETE FROM snapshots WHERE spec_id = ?1 AND pr_number = ?2",
         (spec_id, pr_number),
     )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Delete a single snapshot and its indexed data (sections, refs, IDL defs).
+pub fn delete_commit_snapshot(conn: &Connection, snapshot_id: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM refs WHERE snapshot_id = ?1", [snapshot_id])?;
+    tx.execute("DELETE FROM idl_defs WHERE snapshot_id = ?1", [snapshot_id])?;
+    tx.execute("DELETE FROM sections WHERE snapshot_id = ?1", [snapshot_id])?;
+    tx.execute("DELETE FROM snapshots WHERE id = ?1", [snapshot_id])?;
     tx.commit()?;
     Ok(())
 }
@@ -318,11 +335,19 @@ pub fn record_update_check(
     last_checked: &str,
     last_indexed: Option<&str>,
     content_hash: Option<&str>,
+    index_version: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO update_checks (spec_id, last_checked, last_indexed, content_hash)
-         VALUES (?1, ?2, ?3, ?4)",
-        (spec_id, last_checked, last_indexed, content_hash),
+        "INSERT OR REPLACE INTO update_checks \
+         (spec_id, last_checked, last_indexed, content_hash, index_version)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            spec_id,
+            last_checked,
+            last_indexed,
+            content_hash,
+            index_version,
+        ),
     )?;
 
     Ok(())
@@ -386,6 +411,16 @@ mod tests {
         let snapshot_id =
             insert_snapshot(&conn, spec_id, "abc123", "2026-01-01T00:00:00Z").unwrap();
 
+        // insert_snapshot stamps the current index version.
+        let snap_pv: Option<String> = conn
+            .query_row(
+                "SELECT index_version FROM snapshots WHERE id = ?1",
+                [snapshot_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(snap_pv.as_deref(), Some(crate::parse::INDEX_VERSION));
+
         let sections = vec![
             ParsedSection {
                 anchor: "intro".to_string(),
@@ -426,6 +461,58 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sections_fts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(fts_count, 2);
+    }
+
+    #[test]
+    fn test_delete_commit_snapshot() {
+        let conn = db::open_test_db().unwrap();
+        let spec_id =
+            insert_or_get_spec(&conn, "HTML", "https://html.spec.whatwg.org", "whatwg").unwrap();
+
+        let section = |anchor: &str| ParsedSection {
+            anchor: anchor.to_string(),
+            title: Some(anchor.to_string()),
+            content_text: None,
+            section_type: SectionType::Heading,
+            parent_anchor: None,
+            prev_anchor: None,
+            next_anchor: None,
+            depth: Some(2),
+        };
+
+        let target = insert_snapshot(&conn, spec_id, "sha-a", "2026-01-01T00:00:00Z").unwrap();
+        insert_sections_bulk(&conn, target, &[section("a")]).unwrap();
+        // A second snapshot that must be left untouched.
+        let other = insert_snapshot(&conn, spec_id, "sha-b", "2026-01-01T00:00:00Z").unwrap();
+        insert_sections_bulk(&conn, other, &[section("b")]).unwrap();
+
+        delete_commit_snapshot(&conn, target).unwrap();
+
+        let target_snaps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE id = ?1",
+                [target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_snaps, 0, "target snapshot should be deleted");
+        let target_secs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sections WHERE snapshot_id = ?1",
+                [target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_secs, 0, "target sections should be deleted");
+
+        let other_secs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sections WHERE snapshot_id = ?1",
+                [other],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_secs, 1, "unrelated snapshot must be untouched");
     }
 
     #[test]
@@ -697,6 +784,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             Some("2026-01-01T00:00:00Z"),
             Some("deadbeef"),
+            Some("0.1.0"),
         )
         .unwrap();
 
@@ -717,6 +805,7 @@ mod tests {
             "2026-01-02T00:00:00Z",
             None,
             Some("beadfeed"),
+            Some("0.2.0"),
         )
         .unwrap();
 
@@ -729,15 +818,21 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
 
-        let (checked, indexed, hash): (String, Option<String>, Option<String>) = conn
+        let (checked, indexed, hash, index_version): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
             .query_row(
-                "SELECT last_checked, last_indexed, content_hash FROM update_checks WHERE spec_id = ?1",
+                "SELECT last_checked, last_indexed, content_hash, index_version FROM update_checks WHERE spec_id = ?1",
                 [spec_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
         assert_eq!(checked, "2026-01-02T00:00:00Z");
         assert_eq!(indexed, None);
         assert_eq!(hash.as_deref(), Some("beadfeed"));
+        assert_eq!(index_version.as_deref(), Some("0.2.0"));
     }
 }

@@ -239,7 +239,24 @@ async fn fetch_merge_base(spec_name: &str, base_url: &str, full_sha: &str) -> Re
     parse::parse_spec(&html, spec_name, base_url)
 }
 
+/// Whether a snapshot was produced by the current build. An `INDEX_VERSION`
+/// bump makes cached snapshots (including reused merge bases) stale, so they
+/// must be re-fetched and re-parsed. A legacy integer value written by an
+/// earlier build fails the text read and is treated as stale.
+fn snapshot_index_is_current(conn: &Connection, snapshot_id: i64) -> bool {
+    conn.query_row(
+        "SELECT index_version FROM snapshots WHERE id = ?1",
+        [snapshot_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .map(|v| v.as_deref() == Some(crate::parse::INDEX_VERSION))
+    .unwrap_or(false)
+}
+
 fn is_pr_snapshot_valid(conn: &Connection, snapshot_id: i64) -> bool {
+    if !snapshot_index_is_current(conn, snapshot_id) {
+        return false;
+    }
     conn.query_row(
         "SELECT COUNT(*) FROM sections WHERE snapshot_id = ?1",
         [snapshot_id],
@@ -319,19 +336,28 @@ pub async fn ensure_pr_indexed(
     // Resolve short merge base SHA to full SHA
     let full_base_sha = resolve_full_sha(&repo, &preview.merge_base_sha).await?;
 
-    // Fetch or reuse merge base snapshot
-    let base_snap_id =
-        if let Some(id) = queries::get_commit_snapshot(conn, spec_id, &full_base_sha)? {
-            id
-        } else {
+    // Fetch or reuse merge base snapshot. Reuse it only if the current parser
+    // produced it; otherwise re-fetch so it stays consistent with the PR
+    // snapshot. The re-fetch happens BEFORE deleting the stale copy so that a
+    // fetch failure leaves the existing (usable) base intact rather than
+    // destroying it; deleting first also avoids the UNIQUE(spec_id, sha)
+    // conflict a plain re-insert would hit.
+    let existing_base = queries::get_commit_snapshot(conn, spec_id, &full_base_sha)?;
+    let base_snap_id = match existing_base {
+        Some(id) if snapshot_index_is_current(conn, id) => id,
+        maybe_stale => {
             let base_parsed = fetch_merge_base(spec_name, base_url, &full_base_sha).await?;
+            if let Some(stale_id) = maybe_stale {
+                write::delete_commit_snapshot(conn, stale_id)?;
+            }
             let commit_date = chrono::Utc::now().to_rfc3339();
             let id = write::insert_snapshot(conn, spec_id, &full_base_sha, &commit_date)?;
             write::insert_sections_bulk(conn, id, &base_parsed.sections)?;
             write::insert_refs_bulk(conn, id, &base_parsed.references)?;
             write::insert_idl_defs_bulk(conn, id, &base_parsed.idl_definitions)?;
             id
-        };
+        }
+    };
 
     // Fetch and parse PR pages
     let pr_parsed = fetch_pr_pages(&preview, spec_name, base_url).await?;
@@ -438,6 +464,65 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        assert!(!is_pr_snapshot_valid(&conn, pr_snap_id));
+    }
+
+    #[test]
+    fn test_pr_snapshot_stale_parser_not_valid() {
+        use crate::db;
+        use crate::db::write;
+        use crate::model::{ParsedSection, SectionType};
+
+        let conn = db::open_test_db().unwrap();
+        let spec_id =
+            write::insert_or_get_spec(&conn, "HTML", "https://html.spec.whatwg.org", "whatwg")
+                .unwrap();
+
+        let pr_snap_id = write::insert_pr_snapshot(
+            &conn,
+            spec_id,
+            "pr:99:deadbeef",
+            "2026-01-01T00:00:00Z",
+            99,
+            "basesha",
+            &[],
+        )
+        .unwrap();
+        // Give it a section so the emptiness check is satisfied and parser
+        // version is the only thing under test.
+        write::insert_sections_bulk(
+            &conn,
+            pr_snap_id,
+            &[ParsedSection {
+                anchor: "sec-a".into(),
+                title: Some("A".into()),
+                content_text: None,
+                section_type: SectionType::Heading,
+                parent_anchor: None,
+                prev_anchor: None,
+                next_anchor: None,
+                depth: Some(2),
+            }],
+        )
+        .unwrap();
+
+        // Freshly inserted -> stamped with the current build -> valid.
+        assert!(is_pr_snapshot_valid(&conn, pr_snap_id));
+
+        // Produced by an older build -> stale -> not valid.
+        conn.execute(
+            "UPDATE snapshots SET index_version = ?1 WHERE id = ?2",
+            ("0.0.0", pr_snap_id),
+        )
+        .unwrap();
+        assert!(!is_pr_snapshot_valid(&conn, pr_snap_id));
+
+        // Pre-upgrade rows (NULL index_version) -> not valid either.
+        conn.execute(
+            "UPDATE snapshots SET index_version = NULL WHERE id = ?1",
+            [pr_snap_id],
+        )
+        .unwrap();
         assert!(!is_pr_snapshot_valid(&conn, pr_snap_id));
     }
 
