@@ -154,9 +154,10 @@ fn parse_generic_html(document: &Html, converter: &HtmlToMarkdown) -> Result<Vec
     // - headings (h2-h6 with id) — WHATWG/W3C specs
     // - definitions (dfn with id) — all specs
     // - emu-clause/emu-annex (with id) — TC39/ecmarkup specs
+    // - emu-production (with id) — TC39/ecmarkup grammar productions (#prod-*)
     // - tr/dt/section/li with id — W3C specs use these as named anchor targets
     let selector = Selector::parse(
-        "h2[id], h3[id], h4[id], h5[id], h6[id], dfn[id], emu-clause[id], emu-annex[id], tr[id], dt[id], section[id], li[id]",
+        "h2[id], h3[id], h4[id], h5[id], h6[id], dfn[id], emu-clause[id], emu-annex[id], emu-production[id], tr[id], dt[id], section[id], li[id]",
     )
     .map_err(|e| anyhow::anyhow!("Invalid selector: {:?}", e))?;
 
@@ -179,6 +180,15 @@ fn parse_generic_html(document: &Html, converter: &HtmlToMarkdown) -> Result<Vec
             }
             "emu-clause" | "emu-annex" => {
                 if let Some(section) = sections::parse_emu_clause_element(&element, converter)? {
+                    sections.push(section);
+                }
+            }
+            "emu-production" => {
+                // Grammar productions live inside emu-clause content, but each
+                // one is still a distinct queryable anchor (#prod-*), so unlike
+                // dfns we do not skip them based on emu-clause ancestry.
+                if let Some(section) = sections::parse_emu_production_element(&element, converter)?
+                {
                     sections.push(section);
                 }
             }
@@ -401,6 +411,54 @@ mod tests {
         assert_eq!(
             parsed.sections[2].prev_anchor,
             Some("sec-undefined-type".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_spec_ecmarkup_grammar_production() {
+        // ecmarkup emits grammar productions as <emu-production> carrying the
+        // canonical #prod-* anchor. They live inside emu-clause content but must
+        // still be collected as their own queryable sections.
+        let html = r#"
+            <emu-clause id="sec-import-calls">
+                <h1><span class="secnum">13.3.10</span> Import Calls</h1>
+                <h2>Syntax</h2>
+                <emu-grammar type="definition">
+                    <emu-production name="ImportCall" params="Yield, Await" id="prod-ImportCall">
+                        <emu-nt>ImportCall</emu-nt>
+                        <emu-geq>:</emu-geq>
+                        <emu-t>import</emu-t>
+                        <emu-t>(</emu-t>
+                        <emu-nt>AssignmentExpression</emu-nt>
+                        <emu-t>)</emu-t>
+                    </emu-production>
+                </emu-grammar>
+            </emu-clause>
+        "#;
+
+        let parsed = parse_spec(html, "ECMA-262", "https://tc39.es/ecma262").unwrap();
+
+        // Both the clause and the production must be indexed.
+        let production = parsed
+            .sections
+            .iter()
+            .find(|s| s.anchor == "prod-ImportCall")
+            .expect("emu-production should be collected as a section");
+
+        assert_eq!(production.section_type, SectionType::Definition);
+        assert_eq!(production.title, Some("ImportCall".to_string()));
+        // The enclosing clause is still collected.
+        assert!(
+            parsed
+                .sections
+                .iter()
+                .any(|s| s.anchor == "sec-import-calls"),
+            "enclosing emu-clause should still be collected"
+        );
+        // Production is parented to the enclosing clause.
+        assert_eq!(
+            production.parent_anchor,
+            Some("sec-import-calls".to_string())
         );
     }
 
