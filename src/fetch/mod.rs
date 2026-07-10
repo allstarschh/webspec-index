@@ -163,37 +163,15 @@ async fn sync_known_spec(
     )
 }
 
+/// Same as [`sync_known_spec`], for ad-hoc URL-based specs whose provider is
+/// always "dynamic".
 async fn sync_dynamic_spec(
     conn: &Connection,
     spec_name: &str,
     base_url: &str,
     force: bool,
 ) -> Result<(i64, bool)> {
-    let spec_id = write::insert_or_get_spec(conn, spec_name, base_url, "dynamic")?;
-    let previous_snapshot_id = queries::get_snapshot(conn, spec_name)?;
-    let state = queries::get_update_check(conn, spec_id)?;
-    let now = Utc::now();
-
-    if !force {
-        if let (Some(snapshot_id), Some(sync_state)) = (previous_snapshot_id, state.as_ref()) {
-            if is_fresh(&sync_state.last_checked, &now) {
-                return Ok((snapshot_id, false));
-            }
-        }
-    }
-
-    let html = fetch_live_html(base_url).await?;
-    sync_from_html(
-        conn,
-        spec_id,
-        spec_name,
-        base_url,
-        "dynamic",
-        html,
-        previous_snapshot_id,
-        state,
-        &now,
-    )
+    sync_known_spec(conn, spec_name, base_url, "dynamic", force).await
 }
 
 /// Ensure an ad-hoc URL-based spec is indexed.
