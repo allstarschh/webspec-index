@@ -138,6 +138,13 @@ fn is_pr_snapshot_valid(conn: &Connection, snapshot_id: i64) -> bool {
     .unwrap_or(false)
 }
 
+/// Truncate to at most `max_chars` characters for logging. Iterates by `char`
+/// rather than slicing at a byte index, which would panic if the cut fell inside
+/// a multi-byte UTF-8 sequence.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 /// Look up a previously-cached PR snapshot and its merge-base snapshot, returning
 /// their ids only when both are present. Used as the offline fallback when PR
 /// resolution fails: unlike the freshness fast path, this also accepts a snapshot
@@ -263,7 +270,7 @@ pub async fn ensure_pr_indexed(
             eprintln!(
                 "Fetching merge base {}: {}",
                 spec_name,
-                &resolved.base_html_url[..resolved.base_html_url.len().min(80)]
+                truncate_chars(&resolved.base_html_url, 80)
             );
             let html = super::fetch_raw_html(&resolved.base_html_url).await?;
             let base_parsed = parse::parse_spec(&html, spec_name, base_url)?;
@@ -303,6 +310,20 @@ pub async fn ensure_pr_indexed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A byte-index slice at 80 would panic when the offset lands inside a
+    // multi-byte UTF-8 sequence; the char-based truncation must not.
+    #[test]
+    fn test_truncate_chars_multibyte_safe() {
+        // 100 accented chars: byte length is 200, so slicing at byte 80 would
+        // fall mid-character and panic.
+        let url = "é".repeat(100);
+        assert!(url.len() > 80 && url.chars().count() == 100);
+        let truncated = truncate_chars(&url, 80);
+        assert_eq!(truncated.chars().count(), 80);
+        // Shorter-than-limit input is returned intact.
+        assert_eq!(truncate_chars("abc", 80), "abc");
+    }
 
     #[test]
     fn test_empty_pr_snapshot_not_treated_as_cached() {
