@@ -1,5 +1,6 @@
 // Fetch orchestration: coordinate HTML fetching, parsing, and database writes
 pub mod github;
+pub mod pr;
 pub mod snapshot;
 pub mod whatpr;
 

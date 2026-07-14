@@ -150,7 +150,7 @@ pub async fn query_section(
         let _ =
             ensure_indexed_for_spec_name(&conn, &registry, &spec_name, base_url_hint.as_deref())
                 .await?;
-        let (pr_snap, base_snap) = fetch::whatpr::ensure_pr_indexed(
+        let (pr_snap, base_snap) = fetch::pr::ensure_pr_indexed(
             &conn,
             &canonical_name,
             &base_url,
@@ -278,7 +278,7 @@ pub async fn check_exists(
         let _ =
             ensure_indexed_for_spec_name(&conn, &registry, &spec_name, base_url_hint.as_deref())
                 .await?;
-        let (pr_snap, base_snap) = fetch::whatpr::ensure_pr_indexed(
+        let (pr_snap, base_snap) = fetch::pr::ensure_pr_indexed(
             &conn,
             &canonical_name,
             &base_url,
@@ -430,7 +430,7 @@ pub async fn find_anchors(
         let (canonical_name, base_url, provider) =
             resolve_spec_metadata(&conn, &registry, spec_name, None)?;
         let _ = ensure_indexed_for_spec_name(&conn, &registry, spec_name, None).await?;
-        let (pr_snap, base_snap) = fetch::whatpr::ensure_pr_indexed(
+        let (pr_snap, base_snap) = fetch::pr::ensure_pr_indexed(
             &conn,
             &canonical_name,
             &base_url,
@@ -495,7 +495,7 @@ pub async fn search_sections(
         let (canonical_name, base_url, provider) =
             resolve_spec_metadata(&conn, &registry, spec_name, None)?;
         let _ = ensure_indexed_for_spec_name(&conn, &registry, spec_name, None).await?;
-        let (pr_snap, base_snap) = fetch::whatpr::ensure_pr_indexed(
+        let (pr_snap, base_snap) = fetch::pr::ensure_pr_indexed(
             &conn,
             &canonical_name,
             &base_url,
@@ -610,7 +610,7 @@ pub async fn list_headings(
         let (canonical_name, base_url, provider) =
             resolve_spec_metadata(&conn, &registry, spec, None)?;
         let _ = ensure_indexed_for_spec_name(&conn, &registry, spec, None).await?;
-        let (pr_snap, _base_snap) = fetch::whatpr::ensure_pr_indexed(
+        let (pr_snap, _base_snap) = fetch::pr::ensure_pr_indexed(
             &conn,
             &canonical_name,
             &base_url,
@@ -1420,7 +1420,7 @@ pub async fn query_idl(
         if let Some(pr_opts) = pr {
             let (canonical_name, base_url, provider) =
                 resolve_spec_metadata(&conn, &registry, spec_name, None)?;
-            let _ = fetch::whatpr::ensure_pr_indexed(
+            let _ = fetch::pr::ensure_pr_indexed(
                 &conn,
                 &canonical_name,
                 &base_url,
@@ -1437,7 +1437,7 @@ pub async fn query_idl(
         if let Some(pr_opts) = pr {
             let (canonical_name, base_url, provider) =
                 resolve_spec_metadata(&conn, &registry, &spec_name, base_url_hint.as_deref())?;
-            let _ = fetch::whatpr::ensure_pr_indexed(
+            let _ = fetch::pr::ensure_pr_indexed(
                 &conn,
                 &canonical_name,
                 &base_url,
@@ -1474,7 +1474,7 @@ pub async fn find_references(
             if let Some(pr_opts) = pr {
                 let (canonical_name, base_url, provider) =
                     resolve_spec_metadata(&conn, &registry, &canonical_spec_name, None)?;
-                let _ = fetch::whatpr::ensure_pr_indexed(
+                let _ = fetch::pr::ensure_pr_indexed(
                     &conn,
                     &canonical_name,
                     &base_url,
@@ -1498,7 +1498,7 @@ pub async fn pr_diff(spec: &str, pr_opts: &model::PrOpts) -> Result<model::PrDif
     let registry = spec_registry::SpecRegistry::new();
     let (canonical_name, base_url, provider) = resolve_spec_metadata(&conn, &registry, spec, None)?;
     let _ = ensure_indexed_for_spec_name(&conn, &registry, spec, None).await?;
-    let (pr_snap_id, base_snap_id) = fetch::whatpr::ensure_pr_indexed(
+    let (pr_snap_id, base_snap_id) = fetch::pr::ensure_pr_indexed(
         &conn,
         &canonical_name,
         &base_url,

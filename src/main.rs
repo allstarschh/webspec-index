@@ -20,9 +20,10 @@ use webspec_index::{format, model};
         webspec-index query RFC9110#section-5\n  \
         webspec-index query draft-touch-sne#section-1\n  \
         webspec-index query draft-touch-sne-02#section-1   (pinned version)\n\n\
-        WHATWG PR previews — query spec sections as modified by an open PR:\n  \
+        PR previews (WHATWG specs, TC39 proposals) — query sections as modified by an open PR:\n  \
         webspec-index query HTML#navigate --pr 12345\n  \
-        webspec-index query HTML#navigate --pr 12345 --diff\n  \
+        webspec-index query HTML --pr 12345 --diff\n  \
+        webspec-index query proposal-defer-import-eval --pr 85 --diff\n  \
         webspec-index clear-pr                              (list cached PRs)\n  \
         webspec-index clear-pr --spec HTML --pr 12345       (remove cached PR)\n\n\
         Examples:\n  \
@@ -79,16 +80,19 @@ enum Command {
         The argument can be SPEC#anchor or a full spec URL:\n  \
         webspec-index query HTML#navigate\n  \
         webspec-index query \"https://html.spec.whatwg.org/#navigate\"\n\n\
-        Use --pr to query against a WHATWG PR preview (lazily fetched from whatpr.org).\n\
-        Sections not modified by the PR fall back to the merge base.\n\
-        Use --diff to see a section-level diff between the PR and its merge base:\n  \
+        Use --pr to query against a PR preview — WHATWG specs (via whatpr.org) or\n\
+        TC39 proposals (via the PR's built index.html). Sections not modified by\n\
+        the PR fall back to the merge base.\n\
+        Use --diff to see a section-level diff of the whole PR vs its merge base;\n\
+        with --diff the #anchor is optional (a bare spec name previews all changes):\n  \
         webspec-index query HTML#navigate --pr 12345\n  \
-        webspec-index query HTML#navigate --pr 12345 --diff --format markdown")]
+        webspec-index query HTML --pr 12345 --diff --format markdown\n  \
+        webspec-index query proposal-defer-import-eval --pr 85 --diff")]
     Query {
-        /// Section identifier: SPEC#anchor or full URL
+        /// Section identifier: SPEC#anchor or full URL (bare SPEC allowed with --diff)
         spec_anchor: String,
 
-        #[arg(long, help = "Query against a WHATWG PR preview")]
+        #[arg(long, help = "Query against a WHATWG or TC39 proposal PR preview")]
         pr: Option<i64>,
 
         #[arg(long, help = "Show diff between PR and merge base (requires --pr)")]
@@ -115,7 +119,10 @@ enum Command {
         #[arg(long, short, default_value = "20", help = "Maximum number of results")]
         limit: u32,
 
-        #[arg(long, help = "Search within a WHATWG PR preview (requires --spec)")]
+        #[arg(
+            long,
+            help = "Search within a WHATWG or TC39 proposal PR preview (requires --spec)"
+        )]
         pr: Option<i64>,
 
         #[arg(long, help = "Force re-fetch of PR preview data")]
@@ -127,7 +134,7 @@ enum Command {
         /// Section identifier: SPEC#anchor or full URL
         spec_anchor: String,
 
-        #[arg(long, help = "Query against a WHATWG PR preview")]
+        #[arg(long, help = "Query against a WHATWG or TC39 proposal PR preview")]
         pr: Option<i64>,
 
         #[arg(long, help = "Force re-fetch of PR preview data")]
@@ -151,7 +158,10 @@ enum Command {
         #[arg(long, short, default_value = "50", help = "Maximum number of results")]
         limit: u32,
 
-        #[arg(long, help = "Search within a WHATWG PR preview (requires --spec)")]
+        #[arg(
+            long,
+            help = "Search within a WHATWG or TC39 proposal PR preview (requires --spec)"
+        )]
         pr: Option<i64>,
 
         #[arg(long, help = "Force re-fetch of PR preview data")]
@@ -163,7 +173,7 @@ enum Command {
         /// Spec name (e.g. HTML, DOM, CSS-GRID)
         spec: String,
 
-        #[arg(long, help = "Query against a WHATWG PR preview")]
+        #[arg(long, help = "Query against a WHATWG or TC39 proposal PR preview")]
         pr: Option<i64>,
 
         #[arg(long, help = "Force re-fetch of PR preview data")]
@@ -195,7 +205,7 @@ enum Command {
         #[arg(long, short, default_value = "10", help = "Maximum number of matches")]
         limit: u32,
 
-        #[arg(long, help = "Query against a WHATWG PR preview")]
+        #[arg(long, help = "Query against a WHATWG or TC39 proposal PR preview")]
         pr: Option<i64>,
 
         #[arg(long, help = "Force re-fetch of PR preview data")]
@@ -271,7 +281,7 @@ enum Command {
         #[arg(long, short, default_value = "20", help = "Maximum number of matches")]
         limit: u32,
 
-        #[arg(long, help = "Query against a WHATWG PR preview")]
+        #[arg(long, help = "Query against a WHATWG or TC39 proposal PR preview")]
         pr: Option<i64>,
 
         #[arg(long, help = "Force re-fetch of PR preview data")]
@@ -436,11 +446,11 @@ graph <SPEC#anchor|URL> [-d incoming|outgoing|both(default outgoing)] [--max-dep
 idl <Q|SPEC#anchor|URL> [-s SPEC] [-l N(20)] [--pr N] [--format json|markdown]
 SPEC#anchor examples: HTML#navigate, DOM#concept-tree, CSS-GRID#grid-container
 Full URL also works: https://html.spec.whatwg.org/#navigate
---pr N: query against WHATWG PR preview; --diff: show diff vs merge base (requires --pr)
+--pr N: query against a PR preview (WHATWG specs or TC39 proposals); --diff: show diff vs merge base (requires --pr; #anchor optional with --diff)
 Ex: query HTML#navigate|search "tree order" -s DOM|anchors "*-tree" -s DOM
 Ex: refs HTML#navigate -d incoming|refs Window.navigation|graph HTML#navigate --graph-format mermaid
 Ex: idl Window.navigation|idl Window.open()|idl HTML#dom-window-navigation
-Ex: query HTML#navigate --pr 1234|query HTML#navigate --pr 1234 --diff
+Ex: query HTML#navigate --pr 1234|query HTML --pr 1234 --diff|query proposal-defer-import-eval --pr 85 --diff
 "#
     );
 }
@@ -499,7 +509,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             });
             if diff {
                 let opts = pr_opts.as_ref().context("--diff requires --pr")?;
-                let (spec_name, _, _) = webspec_index::parse_spec_anchor(&spec_anchor)?;
+                // A whole-PR diff needs only the spec, so accept a bare spec
+                // name (e.g. `HTML`); fall back to it when there's no #anchor.
+                let spec_name = webspec_index::parse_spec_anchor(&spec_anchor)
+                    .map(|(name, _, _)| name)
+                    .unwrap_or_else(|_| spec_anchor.clone());
                 let result = webspec_index::pr_diff(&spec_name, opts).await?;
                 print_output(&cli.format, &result, format::pr_diff);
                 return Ok(ExitCode::SUCCESS);
