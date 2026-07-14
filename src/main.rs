@@ -510,10 +510,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             if diff {
                 let opts = pr_opts.as_ref().context("--diff requires --pr")?;
                 // A whole-PR diff needs only the spec, so accept a bare spec
-                // name (e.g. `HTML`); fall back to it when there's no #anchor.
-                let spec_name = webspec_index::parse_spec_anchor(&spec_anchor)
-                    .map(|(name, _, _)| name)
-                    .unwrap_or_else(|_| spec_anchor.clone());
+                // name (e.g. `HTML`). Only a bare name (no `#`, not a URL) may
+                // skip parsing; a malformed SPEC#anchor or unrecognized URL
+                // still surfaces parse_spec_anchor's clear error rather than
+                // failing later as an opaque "Unknown spec".
+                let spec_name = webspec_index::diff_spec_name(&spec_anchor)?;
                 let result = webspec_index::pr_diff(&spec_name, opts).await?;
                 print_output(&cli.format, &result, format::pr_diff);
                 return Ok(ExitCode::SUCCESS);

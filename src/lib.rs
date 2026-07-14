@@ -56,6 +56,19 @@ pub fn parse_spec_anchor(input: &str) -> Result<(String, String, Option<String>)
     Ok((parts[0].to_string(), parts[1].to_string(), None))
 }
 
+/// Resolve the spec name for a whole-PR `--diff`, which needs only the spec (no
+/// `#anchor`). A genuine bare name (no `#`, not a URL) is accepted as-is; a
+/// malformed `SPEC#anchor` or unrecognized URL surfaces `parse_spec_anchor`'s
+/// clear error rather than being passed through to fail later as an opaque
+/// "Unknown spec".
+pub fn diff_spec_name(spec_anchor: &str) -> Result<String> {
+    match parse_spec_anchor(spec_anchor) {
+        Ok((name, _, _)) => Ok(name),
+        Err(e) if spec_anchor.contains('#') || spec_anchor.contains("://") => Err(e),
+        Err(_) => Ok(spec_anchor.to_string()),
+    }
+}
+
 /// Return indexed/discovered spec base URLs
 pub fn spec_urls() -> Vec<model::SpecUrlEntry> {
     let conn = match db::open_or_create_db() {
@@ -1933,6 +1946,31 @@ mod tests {
     fn parse_spec_anchor_unknown_url() {
         let result = parse_spec_anchor("https://example.com/#foo");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn diff_spec_name_accepts_bare_name() {
+        // A whole-PR --diff takes a bare spec name; there is no #anchor to parse.
+        assert_eq!(diff_spec_name("HTML").unwrap(), "HTML");
+    }
+
+    #[test]
+    fn diff_spec_name_extracts_from_spec_anchor() {
+        // A valid SPEC#anchor still yields just the spec name.
+        assert_eq!(diff_spec_name("HTML#navigate").unwrap(), "HTML");
+    }
+
+    #[test]
+    fn diff_spec_name_rejects_malformed_spec_anchor() {
+        // A '#' present but unparseable must surface the parse error, not be
+        // passed through as a literal name that fails later as "Unknown spec".
+        assert!(diff_spec_name("HTML#a#b").is_err());
+    }
+
+    #[test]
+    fn diff_spec_name_rejects_unrecognized_url() {
+        // A URL that doesn't resolve must surface the parse error too.
+        assert!(diff_spec_name("https://example.com/#foo").is_err());
     }
 
     #[test]
