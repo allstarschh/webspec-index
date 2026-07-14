@@ -186,12 +186,19 @@ fn resolve_fetch(
     }
 }
 
+/// Sync a spec, optionally falling back to the cached snapshot when the live
+/// fetch fails. `allow_fallback` is the caller's policy: the query path
+/// (`ensure_indexed`) sets it so a stale-but-cached spec is still served when
+/// offline, while the explicit `update` command clears it so fetch failures are
+/// reported rather than masquerading as success. A forced refresh never falls
+/// back regardless, so `--force` always surfaces failures.
 async fn sync_known_spec(
     conn: &Connection,
     spec_name: &str,
     base_url: &str,
     provider_name: &str,
     force: bool,
+    allow_fallback: bool,
 ) -> Result<(i64, bool)> {
     let spec_id = write::insert_or_get_spec(conn, spec_name, base_url, provider_name)?;
     let previous_snapshot_id = queries::get_snapshot(conn, spec_name)?;
@@ -206,13 +213,45 @@ async fn sync_known_spec(
         }
     }
 
-    // A forced refresh must surface fetch failures; otherwise fall back to the
-    // cached snapshot when offline.
-    match resolve_fetch(
-        fetch_live_html(base_url).await,
+    let fetched = fetch_live_html(base_url).await;
+    apply_fetch(
+        conn,
+        spec_id,
+        spec_name,
+        base_url,
+        provider_name,
+        fetched,
         previous_snapshot_id,
-        !force,
-    )? {
+        state,
+        allow_fallback,
+        force,
+        &now,
+    )
+}
+
+/// Turn a live-fetch result into a synced snapshot, applying the caller's
+/// offline-fallback policy. Fall back to the cached snapshot on fetch failure
+/// only when the caller allows it (the query path) AND this is not a forced
+/// refresh — the `update` command disallows fallback so a failed fetch is
+/// reported rather than hidden, and `--force` always surfaces failures.
+///
+/// Split out of [`sync_known_spec`] so the fetch-failure branches are testable
+/// without hitting the network.
+#[allow(clippy::too_many_arguments)]
+fn apply_fetch(
+    conn: &Connection,
+    spec_id: i64,
+    spec_name: &str,
+    base_url: &str,
+    provider_name: &str,
+    fetched: Result<String>,
+    previous_snapshot_id: Option<i64>,
+    state: Option<queries::UpdateCheckState>,
+    allow_fallback: bool,
+    force: bool,
+    now: &DateTime<Utc>,
+) -> Result<(i64, bool)> {
+    match resolve_fetch(fetched, previous_snapshot_id, allow_fallback && !force)? {
         FetchOutcome::ServeCached(snapshot_id) => Ok((snapshot_id, false)),
         FetchOutcome::Fresh(html) => sync_from_html(
             conn,
@@ -223,7 +262,7 @@ async fn sync_known_spec(
             html,
             previous_snapshot_id,
             state,
-            &now,
+            now,
         ),
     }
 }
@@ -235,8 +274,9 @@ async fn sync_dynamic_spec(
     spec_name: &str,
     base_url: &str,
     force: bool,
+    allow_fallback: bool,
 ) -> Result<(i64, bool)> {
-    sync_known_spec(conn, spec_name, base_url, "dynamic", force).await
+    sync_known_spec(conn, spec_name, base_url, "dynamic", force, allow_fallback).await
 }
 
 /// Ensure an ad-hoc URL-based spec is indexed.
@@ -247,7 +287,7 @@ pub async fn ensure_indexed_dynamic(
     spec_name: &str,
     base_url: &str,
 ) -> Result<i64> {
-    let (snapshot_id, _) = sync_dynamic_spec(conn, spec_name, base_url, false).await?;
+    let (snapshot_id, _) = sync_dynamic_spec(conn, spec_name, base_url, false, true).await?;
     Ok(snapshot_id)
 }
 
@@ -261,13 +301,16 @@ pub async fn ensure_indexed(
     base_url: &str,
     provider_name: &str,
 ) -> Result<i64> {
-    let (snapshot_id, _) = sync_known_spec(conn, spec_name, base_url, provider_name, false).await?;
+    let (snapshot_id, _) =
+        sync_known_spec(conn, spec_name, base_url, provider_name, false, true).await?;
     Ok(snapshot_id)
 }
 
 /// Update a spec if needed.
 ///
 /// Returns `Some(snapshot_id)` only when content changed and was re-indexed.
+/// A fetch failure is reported (no offline cache fallback): `update` is an
+/// explicit refresh, so a failed fetch must not be reported as success.
 pub async fn update_if_needed(
     conn: &Connection,
     spec_name: &str,
@@ -276,7 +319,7 @@ pub async fn update_if_needed(
     force: bool,
 ) -> Result<Option<i64>> {
     let (snapshot_id, updated) =
-        sync_known_spec(conn, spec_name, base_url, provider_name, force).await?;
+        sync_known_spec(conn, spec_name, base_url, provider_name, force, false).await?;
     Ok(updated.then_some(snapshot_id))
 }
 
@@ -340,6 +383,46 @@ mod tests {
 
         // Failure with a cache but fallback disallowed (e.g. --force) -> propagate.
         assert!(resolve_fetch(Err(anyhow::anyhow!("offline")), Some(42), false).is_err());
+    }
+
+    // apply_fetch encodes the caller's fallback policy (`allow_fallback && !force`)
+    // over a real cached snapshot: the query path serves the cache when offline,
+    // while `update` (no fallback) and any `--force` refresh surface the failure.
+    #[test]
+    fn test_apply_fetch_fallback_policy() {
+        let conn = db::open_test_db().unwrap();
+        let spec_id =
+            write::insert_or_get_spec(&conn, "TEST", "https://example.test", "test").unwrap();
+        let cached =
+            write::insert_snapshot(&conn, spec_id, "hash:cached", "2026-01-01T00:00:00Z").unwrap();
+        let now = fixed_now();
+
+        let run = |allow_fallback: bool, force: bool| {
+            apply_fetch(
+                &conn,
+                spec_id,
+                "TEST",
+                "https://example.test",
+                "test",
+                Err(anyhow::anyhow!("offline")),
+                Some(cached),
+                None,
+                allow_fallback,
+                force,
+                &now,
+            )
+        };
+
+        // Query path (fallback allowed, not forced) -> serve the cached snapshot.
+        let (id, updated) = run(true, false).unwrap();
+        assert_eq!(id, cached);
+        assert!(!updated);
+
+        // update command (fallback disallowed) -> surface the fetch failure.
+        assert!(run(false, false).is_err());
+
+        // Forced refresh always surfaces the failure, even on the query path.
+        assert!(run(true, true).is_err());
     }
 
     // The freshness gate must require BOTH a fresh timestamp and a matching
