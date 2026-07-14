@@ -188,14 +188,16 @@ pub async fn ensure_pr_indexed(
     }
 
     // Fetch or reuse the merge base snapshot. Reuse it only if the current
-    // parser produced it; otherwise re-fetch so it stays consistent with the PR
-    // snapshot. The re-fetch happens BEFORE deleting the stale copy so that a
-    // fetch failure leaves the existing (usable) base intact rather than
-    // destroying it; deleting first also avoids the UNIQUE(spec_id, sha)
-    // conflict a plain re-insert would hit.
+    // parser produced it AND it is non-empty; otherwise re-fetch so it stays
+    // consistent with the PR snapshot (an empty base would otherwise be cached
+    // forever and make every PR section look newly-added in `--diff`). The
+    // re-fetch happens BEFORE deleting the stale copy so that a fetch failure
+    // leaves the existing (usable) base intact rather than destroying it;
+    // deleting first also avoids the UNIQUE(spec_id, sha) conflict a plain
+    // re-insert would hit.
     let existing_base = queries::get_commit_snapshot(conn, spec_id, &resolved.merge_base_sha)?;
     let base_snap_id = match existing_base {
-        Some(id) if snapshot_index_is_current(conn, id) => id,
+        Some(id) if is_pr_snapshot_valid(conn, id) => id,
         maybe_stale => {
             eprintln!(
                 "Fetching merge base {}: {}",
@@ -328,6 +330,46 @@ mod tests {
         )
         .unwrap();
         assert!(!is_pr_snapshot_valid(&conn, pr_snap_id));
+    }
+
+    // A merge-base (commit) snapshot that fetched but parsed to zero sections
+    // must be treated as invalid so it is re-fetched rather than cached forever;
+    // reusing an empty base would make every PR section look newly-added in
+    // `--diff`. The reuse guard shares `is_pr_snapshot_valid` for exactly this.
+    #[test]
+    fn test_empty_merge_base_snapshot_not_reused() {
+        use crate::db;
+        use crate::model::{ParsedSection, SectionType};
+
+        let conn = db::open_test_db().unwrap();
+        let spec_id =
+            write::insert_or_get_spec(&conn, "HTML", "https://html.spec.whatwg.org", "whatwg")
+                .unwrap();
+
+        // A merge base is a plain commit snapshot (insert_snapshot, keyed by SHA).
+        let base_snap_id =
+            write::insert_snapshot(&conn, spec_id, "basesha", "2026-01-01T00:00:00Z").unwrap();
+
+        // Empty (HTTP 200 but zero sections) -> not reusable.
+        assert!(!is_pr_snapshot_valid(&conn, base_snap_id));
+
+        // Once it has sections it becomes reusable.
+        write::insert_sections_bulk(
+            &conn,
+            base_snap_id,
+            &[ParsedSection {
+                anchor: "sec-a".into(),
+                title: Some("A".into()),
+                content_text: None,
+                section_type: SectionType::Heading,
+                parent_anchor: None,
+                prev_anchor: None,
+                next_anchor: None,
+                depth: Some(2),
+            }],
+        )
+        .unwrap();
+        assert!(is_pr_snapshot_valid(&conn, base_snap_id));
     }
 
     #[test]
