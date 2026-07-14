@@ -118,6 +118,26 @@ fn is_pr_snapshot_valid(conn: &Connection, snapshot_id: i64) -> bool {
     .unwrap_or(false)
 }
 
+/// Look up a previously-cached PR snapshot and its merge-base snapshot, returning
+/// their ids only when both are present. Used as the offline fallback when PR
+/// resolution fails: unlike the freshness fast path, this also accepts a snapshot
+/// produced by an older build rather than erroring.
+fn cached_pr_fallback(
+    conn: &Connection,
+    spec_id: i64,
+    spec_name: &str,
+    pr_number: i64,
+) -> Result<Option<(i64, i64)>> {
+    if let Some((pr_snap_id, stored_base_sha)) =
+        queries::get_pr_snapshot(conn, spec_name, pr_number)?
+    {
+        if let Some(base_snap_id) = queries::get_commit_snapshot(conn, spec_id, &stored_base_sha)? {
+            return Ok(Some((pr_snap_id, base_snap_id)));
+        }
+    }
+    Ok(None)
+}
+
 /// Ensure a PR snapshot is indexed and fresh.
 ///
 /// Returns (pr_snapshot_id, merge_base_snapshot_id). Resolves the PR through the
@@ -161,10 +181,31 @@ pub async fn ensure_pr_indexed(
         }
     }
 
-    // Resolve the PR to concrete fetch URLs via its provider.
-    let resolved = resolver_for(provider)?
+    // Resolve the PR to concrete fetch URLs via its provider. If resolution
+    // fails (e.g. offline) and a previously-cached snapshot for this PR exists
+    // — even one produced by an older build, which the fast path above skips —
+    // serve it as a best-effort fallback rather than erroring, mirroring the
+    // trunk sync's ServeCached behavior. A forced refresh never falls back.
+    let resolved = match resolver_for(provider)?
         .resolve(spec_name, base_url, pr_number)
-        .await?;
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            if !force {
+                if let Some((pr_snap_id, base_snap_id)) =
+                    cached_pr_fallback(conn, spec_id, spec_name, pr_number)?
+                {
+                    eprintln!(
+                        "warning: could not resolve PR #{pr_number} ({e}); \
+                         serving cached preview"
+                    );
+                    return Ok((pr_snap_id, base_snap_id));
+                }
+            }
+            return Err(e);
+        }
+    };
 
     // Check if we already have this PR indexed with the same head SHA.
     if let Some((pr_snap_id, stored_base_sha)) =
@@ -370,6 +411,47 @@ mod tests {
         )
         .unwrap();
         assert!(is_pr_snapshot_valid(&conn, base_snap_id));
+    }
+
+    // On resolve failure, the offline fallback serves a cached PR snapshot only
+    // when BOTH the PR snapshot and its merge base are present — otherwise the
+    // caller must surface the resolution error rather than a partial preview.
+    #[test]
+    fn test_cached_pr_fallback() {
+        use crate::db;
+
+        let conn = db::open_test_db().unwrap();
+        let spec_id =
+            write::insert_or_get_spec(&conn, "HTML", "https://html.spec.whatwg.org", "whatwg")
+                .unwrap();
+
+        // Nothing cached yet -> no fallback.
+        assert!(cached_pr_fallback(&conn, spec_id, "HTML", 99)
+            .unwrap()
+            .is_none());
+
+        // PR snapshot cached but its merge base missing -> still no fallback.
+        let pr_snap_id = write::insert_pr_snapshot(
+            &conn,
+            spec_id,
+            "pr:99:deadbeef",
+            "2026-01-01T00:00:00Z",
+            99,
+            "basesha",
+            &[],
+        )
+        .unwrap();
+        assert!(cached_pr_fallback(&conn, spec_id, "HTML", 99)
+            .unwrap()
+            .is_none());
+
+        // Both present -> serve the cached pair.
+        let base_snap_id =
+            write::insert_snapshot(&conn, spec_id, "basesha", "2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            cached_pr_fallback(&conn, spec_id, "HTML", 99).unwrap(),
+            Some((pr_snap_id, base_snap_id))
+        );
     }
 
     #[test]
