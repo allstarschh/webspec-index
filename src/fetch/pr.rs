@@ -53,8 +53,16 @@ fn resolver_for(provider: &str) -> Result<Box<dyn PrResolver>> {
 }
 
 /// Merge multiple ParsedSpec results (from multi-page fetches) into one.
+///
+/// Multi-page previews can repeat an anchor across pages (a shared section
+/// appearing on two pages). Sections, references, and IDL definitions are all
+/// deduplicated by identity so the extras don't accumulate — the storage layer
+/// does not dedup, so a duplicate would otherwise surface as repeated `refs`/
+/// `idl` entries in the merged preview.
 pub fn merge_parsed_specs(specs: Vec<ParsedSpec>) -> ParsedSpec {
     let mut seen_anchors = std::collections::HashSet::new();
+    let mut seen_refs = std::collections::HashSet::new();
+    let mut seen_idl = std::collections::HashSet::new();
     let mut sections = Vec::new();
     let mut references = Vec::new();
     let mut idl_definitions = Vec::new();
@@ -64,8 +72,20 @@ pub fn merge_parsed_specs(specs: Vec<ParsedSpec>) -> ParsedSpec {
                 sections.push(section);
             }
         }
-        references.extend(spec.references);
-        idl_definitions.extend(spec.idl_definitions);
+        for r in spec.references {
+            if seen_refs.insert((
+                r.from_anchor.clone(),
+                r.to_spec.clone(),
+                r.to_anchor.clone(),
+            )) {
+                references.push(r);
+            }
+        }
+        for d in spec.idl_definitions {
+            if seen_idl.insert((d.anchor.clone(), d.canonical_name.clone())) {
+                idl_definitions.push(d);
+            }
+        }
     }
     ParsedSpec {
         sections,
@@ -456,7 +476,18 @@ mod tests {
 
     #[test]
     fn test_merge_parsed_specs() {
-        use crate::model::{ParsedReference, ParsedSection, ParsedSpec, SectionType};
+        use crate::model::{
+            ParsedIdlDefinition, ParsedReference, ParsedSection, ParsedSpec, SectionType,
+        };
+
+        let idl_b = || ParsedIdlDefinition {
+            anchor: "dom-window".into(),
+            name: "Window".into(),
+            owner: None,
+            kind: "interface".into(),
+            canonical_name: "Window".into(),
+            idl_text: None,
+        };
 
         let spec_a = ParsedSpec {
             sections: vec![ParsedSection {
@@ -470,7 +501,14 @@ mod tests {
                 depth: Some(2),
             }],
             references: vec![],
-            idl_definitions: vec![],
+            idl_definitions: vec![ParsedIdlDefinition {
+                anchor: "dom-document".into(),
+                name: "Document".into(),
+                owner: None,
+                kind: "interface".into(),
+                canonical_name: "Document".into(),
+                idl_text: None,
+            }],
         };
         let spec_b = ParsedSpec {
             sections: vec![ParsedSection {
@@ -488,11 +526,35 @@ mod tests {
                 to_spec: "DOM".into(),
                 to_anchor: "concept-tree".into(),
             }],
-            idl_definitions: vec![],
+            idl_definitions: vec![idl_b()],
         };
 
-        let merged = merge_parsed_specs(vec![spec_a, spec_b]);
+        // A third page repeats sec-b (and its reference and IDL), as a shared
+        // anchor appearing on two preview pages would.
+        let spec_b_dup = ParsedSpec {
+            sections: vec![ParsedSection {
+                anchor: "sec-b".into(),
+                title: Some("B".into()),
+                content_text: None,
+                section_type: SectionType::Heading,
+                parent_anchor: None,
+                prev_anchor: None,
+                next_anchor: None,
+                depth: Some(2),
+            }],
+            references: vec![ParsedReference {
+                from_anchor: "sec-b".into(),
+                to_spec: "DOM".into(),
+                to_anchor: "concept-tree".into(),
+            }],
+            idl_definitions: vec![idl_b()],
+        };
+
+        let merged = merge_parsed_specs(vec![spec_a, spec_b, spec_b_dup]);
+        // Duplicate section, reference, AND IDL definition are all dropped; the
+        // two distinct IDL definitions (Document, Window) survive.
         assert_eq!(merged.sections.len(), 2);
         assert_eq!(merged.references.len(), 1);
+        assert_eq!(merged.idl_definitions.len(), 2);
     }
 }
