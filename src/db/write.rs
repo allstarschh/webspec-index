@@ -200,26 +200,35 @@ pub fn insert_pr_snapshot(
     Ok(conn.last_insert_rowid())
 }
 
+/// Delete the child rows (refs, IDL defs, sections) of every snapshot matched
+/// by `snapshot_filter` — a SQL predicate over the `snapshots` table (e.g.
+/// `"spec_id = ?1 AND pr_number = ?2"`). Does NOT delete the snapshot rows
+/// themselves; the caller deletes those with the same predicate afterward.
+/// Centralizes the per-snapshot child-table list so a new child table only
+/// needs to be added here. `snapshot_filter` is trusted, in-crate SQL — never
+/// user input.
+fn delete_snapshot_children(
+    tx: &Connection,
+    snapshot_filter: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<()> {
+    for table in ["refs", "idl_defs", "sections"] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE snapshot_id IN \
+             (SELECT id FROM snapshots WHERE {snapshot_filter})"
+        );
+        tx.execute(&sql, params)?;
+    }
+    Ok(())
+}
+
 /// Delete all indexed data for a specific PR number.
 pub fn delete_pr_data(conn: &Connection, spec_id: i64, pr_number: i64) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    let filter = "spec_id = ?1 AND pr_number = ?2";
+    delete_snapshot_children(&tx, filter, &[&spec_id, &pr_number])?;
     tx.execute(
-        "DELETE FROM refs WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number = ?2)",
-        (spec_id, pr_number),
-    )?;
-    tx.execute(
-        "DELETE FROM idl_defs WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number = ?2)",
-        (spec_id, pr_number),
-    )?;
-    tx.execute(
-        "DELETE FROM sections WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number = ?2)",
-        (spec_id, pr_number),
-    )?;
-    tx.execute(
-        "DELETE FROM snapshots WHERE spec_id = ?1 AND pr_number = ?2",
+        &format!("DELETE FROM snapshots WHERE {filter}"),
         (spec_id, pr_number),
     )?;
     tx.commit()?;
@@ -229,9 +238,7 @@ pub fn delete_pr_data(conn: &Connection, spec_id: i64, pr_number: i64) -> Result
 /// Delete a single snapshot and its indexed data (sections, refs, IDL defs).
 pub fn delete_commit_snapshot(conn: &Connection, snapshot_id: i64) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM refs WHERE snapshot_id = ?1", [snapshot_id])?;
-    tx.execute("DELETE FROM idl_defs WHERE snapshot_id = ?1", [snapshot_id])?;
-    tx.execute("DELETE FROM sections WHERE snapshot_id = ?1", [snapshot_id])?;
+    delete_snapshot_children(&tx, "id = ?1", &[&snapshot_id])?;
     tx.execute("DELETE FROM snapshots WHERE id = ?1", [snapshot_id])?;
     tx.commit()?;
     Ok(())
@@ -246,51 +253,19 @@ pub fn delete_all_pr_data_for_spec(conn: &Connection, spec_id: i64) -> Result<us
         [spec_id],
         |row| row.get(0),
     )?;
+    let pr_filter = "spec_id = ?1 AND pr_number IS NOT NULL";
+    delete_snapshot_children(&tx, pr_filter, &[&spec_id])?;
     tx.execute(
-        "DELETE FROM refs WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL)",
+        &format!("DELETE FROM snapshots WHERE {pr_filter}"),
         [spec_id],
     )?;
-    tx.execute(
-        "DELETE FROM idl_defs WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL)",
-        [spec_id],
-    )?;
-    tx.execute(
-        "DELETE FROM sections WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL)",
-        [spec_id],
-    )?;
-    tx.execute(
-        "DELETE FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL",
-        [spec_id],
-    )?;
-    // Delete orphaned commit snapshots (merge bases no longer referenced)
-    tx.execute(
-        "DELETE FROM refs WHERE snapshot_id IN \
-         (SELECT s.id FROM snapshots s WHERE s.spec_id = ?1 AND s.pr_number IS NULL \
-          AND s.sha NOT LIKE 'hash:%' \
-          AND s.sha NOT IN (SELECT merge_base_sha FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL))",
-        [spec_id],
-    )?;
-    tx.execute(
-        "DELETE FROM idl_defs WHERE snapshot_id IN \
-         (SELECT s.id FROM snapshots s WHERE s.spec_id = ?1 AND s.pr_number IS NULL \
-          AND s.sha NOT LIKE 'hash:%' \
-          AND s.sha NOT IN (SELECT merge_base_sha FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL))",
-        [spec_id],
-    )?;
-    tx.execute(
-        "DELETE FROM sections WHERE snapshot_id IN \
-         (SELECT s.id FROM snapshots s WHERE s.spec_id = ?1 AND s.pr_number IS NULL \
-          AND s.sha NOT LIKE 'hash:%' \
-          AND s.sha NOT IN (SELECT merge_base_sha FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL))",
-        [spec_id],
-    )?;
-    tx.execute(
-        "DELETE FROM snapshots WHERE spec_id = ?1 AND pr_number IS NULL \
+    // Delete orphaned commit snapshots (merge bases no longer referenced).
+    let orphan_filter = "spec_id = ?1 AND pr_number IS NULL \
          AND sha NOT LIKE 'hash:%' \
-         AND sha NOT IN (SELECT merge_base_sha FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL)",
+         AND sha NOT IN (SELECT merge_base_sha FROM snapshots WHERE spec_id = ?1 AND pr_number IS NOT NULL)";
+    delete_snapshot_children(&tx, orphan_filter, &[&spec_id])?;
+    tx.execute(
+        &format!("DELETE FROM snapshots WHERE {orphan_filter}"),
         [spec_id],
     )?;
     tx.commit()?;
@@ -303,27 +278,9 @@ pub fn delete_all_pr_data_for_spec(conn: &Connection, spec_id: i64) -> Result<us
 /// Used before re-indexing to avoid clobbering PR data.
 pub fn delete_spec_data(conn: &Connection, spec_id: i64) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-
-    tx.execute(
-        "DELETE FROM refs WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number IS NULL AND sha LIKE 'hash:%')",
-        [spec_id],
-    )?;
-    tx.execute(
-        "DELETE FROM idl_defs WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number IS NULL AND sha LIKE 'hash:%')",
-        [spec_id],
-    )?;
-    tx.execute(
-        "DELETE FROM sections WHERE snapshot_id IN \
-         (SELECT id FROM snapshots WHERE spec_id = ?1 AND pr_number IS NULL AND sha LIKE 'hash:%')",
-        [spec_id],
-    )?;
-    tx.execute(
-        "DELETE FROM snapshots WHERE spec_id = ?1 AND pr_number IS NULL AND sha LIKE 'hash:%'",
-        [spec_id],
-    )?;
-
+    let filter = "spec_id = ?1 AND pr_number IS NULL AND sha LIKE 'hash:%'";
+    delete_snapshot_children(&tx, filter, &[&spec_id])?;
+    tx.execute(&format!("DELETE FROM snapshots WHERE {filter}"), [spec_id])?;
     tx.commit()?;
     Ok(())
 }
