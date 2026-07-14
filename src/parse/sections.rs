@@ -358,12 +358,26 @@ fn extract_idl_content(element: &scraper::ElementRef) -> Option<String> {
 
 /// Parse a generic anchor-bearing element (tr, dt, section, li) into a ParsedSection.
 /// W3C specs use these as named targets that don't fit the dfn/heading pattern.
+/// Convert an element's full HTML to trimmed markdown, or `None` if it renders
+/// empty. Shared by the anchor and grammar-production parsers, which both use
+/// the element's own HTML as its content.
+fn element_content_text(
+    element: &scraper::ElementRef,
+    converter: &HtmlToMarkdown,
+) -> Option<String> {
+    let md = super::markdown::element_to_markdown_from_html(&element.html(), converter);
+    let trimmed = md.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub fn parse_anchor_element(
     element: &scraper::ElementRef,
     converter: &HtmlToMarkdown,
 ) -> Result<Option<ParsedSection>> {
-    use super::markdown;
-
     let anchor = match element.value().attr("id") {
         Some(id) => id.to_string(),
         None => return Ok(None),
@@ -388,16 +402,7 @@ pub fn parse_anchor_element(
         Some(truncated)
     };
 
-    let content_text = {
-        let html = element.html();
-        let md = markdown::element_to_markdown_from_html(&html, converter);
-        let trimmed = md.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    };
+    let content_text = element_content_text(element, converter);
 
     Ok(Some(ParsedSection {
         anchor,
@@ -468,8 +473,6 @@ pub fn parse_emu_production_element(
     element: &scraper::ElementRef,
     converter: &HtmlToMarkdown,
 ) -> Result<Option<ParsedSection>> {
-    use super::markdown;
-
     let anchor = match element.value().attr("id") {
         Some(id) => id.to_string(),
         None => return Ok(None), // No id, skip this production
@@ -490,15 +493,7 @@ pub fn parse_emu_production_element(
             }
         });
 
-    let content_text = {
-        let md = markdown::element_to_markdown_from_html(&element.html(), converter);
-        let trimmed = md.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    };
+    let content_text = element_content_text(element, converter);
 
     Ok(Some(ParsedSection {
         anchor,
