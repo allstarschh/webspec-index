@@ -2821,6 +2821,7 @@ dependencies = [
  "libc",
  "markup5ever_rcdom",
  "moz-cli-version-check",
+ "percent-encoding",
  "regex",
  "reqwest 0.13.2",
  "rusqlite",

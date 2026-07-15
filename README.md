@@ -7,7 +7,7 @@ Query WHATWG, W3C, and TC39 web specifications from the command line.
 - **Full-text search** across HTML, DOM, URL, CSS, ECMAScript, and 70+ other specifications
 - **Cross-reference tracking** — see incoming/outgoing references between spec sections
 - **Graph traversal** — build cross-reference graphs with JSON, Mermaid, or Graphviz DOT output
-- **WHATWG PR previews** — query spec sections as modified by an open PR, with section-level diffs
+- **PR previews** — query spec sections as modified by an open WHATWG or TC39 proposal PR, with section-level diffs
 - **Auto URL indexing for whitelisted domains** — query non-hardcoded specs by URL
 - **Fast SQLite indexing** with FTS5 for instant queries
 - **Algorithm and IDL extraction** with rendered markdown content
@@ -66,17 +66,24 @@ webspec-index idl "Window.open()" --spec HTML
 webspec-index update
 ```
 
-### WHATWG PR Previews
+### PR Previews
 
-Query spec sections as they would look after a WHATWG PR is merged. Previews are lazily fetched from [whatpr.org](https://whatpr.org) and cached locally.
+Query spec sections as they would look after a PR is merged. Two providers are supported:
+
+- **WHATWG specs** — previews are lazily fetched from [whatpr.org](https://whatpr.org).
+- **TC39 proposals** — resolved via the GitHub API; the PR's committed `index.html` build is fetched from the head repo, and the merge base from the base repo. (Reflects the *committed* `index.html`, so a PR that edits `spec.emu` without rebuilding will preview the stale build.)
+
+Both are cached locally.
 
 ```bash
 # Query a section from a PR preview (falls back to merge base for unchanged sections)
 webspec-index query "HTML#navigate" --pr 12345
-webspec-index query "HTML#navigate" --pr 12345 --format markdown
+webspec-index query "proposal-defer-import-eval#sec-IsModuleSCCEvaluated" --pr 85 --format markdown
 
-# Diff: see what sections the PR adds or modifies vs the merge base
+# Diff: see what sections the PR adds or modifies vs the merge base.
+# With --diff the #anchor is optional — a bare spec name previews the whole PR.
 webspec-index query "HTML#navigate" --pr 12345 --diff --format markdown
+webspec-index query proposal-defer-import-eval --pr 85 --diff --format markdown
 
 # Force re-fetch (e.g. after the PR is updated)
 webspec-index query "HTML#navigate" --pr 12345 --force-update
@@ -119,7 +126,7 @@ See [editors/vscode/](editors/vscode/) and [editors/zed/](editors/zed/) for deta
 2. **Parses** sections, algorithms, IDL definitions, and cross-references
 3. **Indexes** in SQLite with FTS5 for fast full-text search
 4. **Refreshes snapshots** on a 24h cadence with content-hash change detection
-5. **PR previews** fetch rendered pages from whatpr.org and the merge base from commit-snapshots, storing both as separate snapshots for querying and diffing
+5. **PR previews** fetch the PR build and its merge base (WHATWG: rendered pages from whatpr.org + commit-snapshots; TC39 proposals: committed `index.html` from the head/base repos via the GitHub API), storing both as separate snapshots for querying and diffing
 
 ## Development
 

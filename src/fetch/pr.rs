@@ -1,9 +1,9 @@
 // Provider-agnostic PR-preview orchestration.
 //
 // Each provider implements `PrResolver` to turn a PR into a `ResolvedPr` of
-// concrete fetch URLs (WHATWG via whatpr.org). Everything below — caching,
-// merge-base fetch/reuse, page fetching, snapshot storage — is shared and only
-// ever fetches raw HTML by URL.
+// concrete fetch URLs (WHATWG via whatpr.org, TC39 proposals via the GitHub
+// API). Everything below — caching, merge-base fetch/reuse, page fetching,
+// snapshot storage — is shared and only ever fetches raw HTML by URL.
 
 use crate::db::{queries, write};
 use crate::model::ParsedSpec;
@@ -45,8 +45,9 @@ pub(crate) trait PrResolver {
 fn resolver_for(provider: &str) -> Result<Box<dyn PrResolver>> {
     match provider {
         "whatwg" => Ok(Box::new(super::whatpr::WhatwgResolver)),
+        "tc39" => Ok(Box::new(super::tc39_pr::Tc39Resolver)),
         other => anyhow::bail!(
-            "PR previews are not supported for provider '{other}' — only WHATWG specs"
+            "PR previews are not supported for provider '{other}' — only WHATWG specs and TC39 proposals"
         ),
     }
 }

@@ -2,6 +2,7 @@
 pub mod github;
 pub mod pr;
 pub mod snapshot;
+pub mod tc39_pr;
 pub mod whatpr;
 
 use crate::db::{queries, write};
