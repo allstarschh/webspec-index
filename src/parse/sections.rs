@@ -552,7 +552,10 @@ fn extract_emu_clause_content(
                 continue;
             }
 
-            // For emu-alg, use the dedicated algorithm renderer on its inner <ol>
+            // For emu-alg, use the dedicated algorithm renderer on its inner
+            // <ol>. Source-form emu-alg (ECMA-262's committed spec.html) has no
+            // built <ol> — its steps are markdown text — so fall back to the
+            // source renderer, keeping algorithm bodies in the section content.
             if tag == "emu-alg" {
                 if let Some(ol) = child_elem
                     .children()
@@ -560,6 +563,11 @@ fn extract_emu_clause_content(
                     .find(|c| c.value().name() == "ol")
                 {
                     algo_steps = Some(algorithms::render_algorithm_ol(&ol, converter));
+                } else {
+                    let steps = algorithms::render_algorithm_source(&child_elem);
+                    if !steps.is_empty() {
+                        algo_steps = Some(steps);
+                    }
                 }
                 continue;
             }
